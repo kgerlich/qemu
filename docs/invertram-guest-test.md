@@ -203,3 +203,53 @@ INVERTRAM TEST: PASS
 
 Drop `quiet` from `-append` to see the full kernel boot log alongside the
 test output.
+
+## 6. Speeding it up with KVM
+
+By default the run above uses TCG (software emulation of every guest
+instruction). If the host has hardware virtualization, `-accel kvm -cpu
+host` gets a real speedup — the boot above drops from a few seconds of
+CPU-bound emulation to about 2 seconds wall-clock with well under a
+second of actual CPU time:
+
+```
+./qemu-system-x86_64 -M q35 -m 512 -accel kvm -cpu host \
+  -kernel /tmp/invertram-guest/vmlinuz-virt \
+  -initrd /tmp/invertram-guest/initramfs.cpio.gz \
+  -append "console=ttyS0 quiet" \
+  -device invertram,addr=04.0 \
+  -nographic -no-reboot
+```
+
+Two prerequisites, both diagnosable from inside the box:
+
+```
+grep -oE 'vmx|svm' /proc/cpuinfo   # empty output means no HW virt exposed at all
+ls -la /dev/kvm                    # must exist; group is usually "kvm"
+groups                             # your user must be in that group
+```
+
+If `vmx`/`svm` is missing from `/proc/cpuinfo` and this machine is itself
+a VM (check with `systemd-detect-virt`), the fix is one level up, on
+whatever hypervisor hosts it:
+
+- Nested virtualization must be enabled on the *hypervisor host's* kernel
+  module: `cat /sys/module/kvm_intel/parameters/nested` (Intel) or
+  `cat /sys/module/kvm_amd/parameters/nested` (AMD) should read `1`/`Y`.
+  If not, `echo "options kvm_intel nested=1" > /etc/modprobe.d/kvm-nested.conf`
+  (swap in `kvm_amd` as appropriate) and reload the module or reboot the
+  host.
+- The VM's CPU model must actually expose the flag to the guest — a
+  generic CPU type (e.g. Proxmox's `x86-64-v2-AES`, or QEMU's `qemu64`)
+  strips virtualization extensions. Set it to `host`. On Proxmox:
+  `qm set <vmid> --cpu host`, then `qm reboot <vmid>` (a running VM won't
+  pick up a CPU-type change without a full stop/start — `qm reboot` does
+  this for you).
+
+If `/dev/kvm` exists but isn't accessible, add your user to its owning
+group and open a new login session (group membership is read at login
+time, so an already-open shell won't pick it up):
+
+```
+sudo usermod -aG kvm $USER
+```
