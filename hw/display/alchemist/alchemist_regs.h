@@ -49,4 +49,20 @@
 #define ALCHEMIST_REG_FORCEWAKE_MEDIA_VEBOX(n)     (0xa560 + (n) * 4)
 #define ALCHEMIST_REG_FORCEWAKE_ACK_MEDIA_VEBOX(n) (0x000d70 + (n) * 4)
 
+/*
+ * VRAM/tile sizing - drivers/gpu/drm/xe/regs/xe_regs.h and xe_gt_regs.h.
+ * Both are plain (non-side-effecting) registers xe_vram_probe() reads
+ * once during probe; see alchemist_vram.c for how their values are
+ * derived from our real BAR2 size.
+ */
+#define ALCHEMIST_REG_SG_TILE_ADDR_RANGE(idx) (0x1083a0 + (idx) * 4)
+#define   SG_TILE_SIZE_GB_SHIFT        8   /* GENMASK(17, 8), in GB units */
+#define   SG_TILE_OFFSET_GB_SHIFT      1   /* GENMASK(7, 1), in GB units */
+
+/* XEHP_FLAT_CCS_BASE_ADDR is an MCR register, but rw_with_mcr_steering()
+ * always ends up reading/writing its raw offset regardless of steering -
+ * see docs/alchemist-bringup.md for how this was confirmed. */
+#define ALCHEMIST_REG_XEHP_FLAT_CCS_BASE_ADDR 0x4910
+#define   XEHP_FLAT_CCS_PTR_SHIFT      8   /* GENMASK(31, 8), in 64K units */
+
 #endif

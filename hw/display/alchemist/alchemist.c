@@ -84,6 +84,7 @@ static void pci_alchemist_realize(PCIDevice *pdev, Error **errp)
     AlchemistState *s = ALCHEMIST(pdev);
 
     s->mmio_buf = g_malloc0(ALCHEMIST_MMIO_SIZE);
+    alchemist_vram_init(s);
     memory_region_init_io(&s->mmio, OBJECT(s), &alchemist_mmio_ops, s,
                            "alchemist-mmio", ALCHEMIST_MMIO_SIZE);
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |

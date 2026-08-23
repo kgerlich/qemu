@@ -228,3 +228,65 @@ implemented that register yet. This wasn't in the original phase list -
 the plan's phases 4-7 covered GuC/IRQ/milestone, not VRAM register support.
 Next step is a short research pass on `xe_vram_probe()` to identify the
 exact register, added as an inserted phase before GuC.
+
+## Phase 3.5 — VRAM/tile sizing registers (inserted, not in original plan)
+
+Read `xe_vram.c` directly to find the exact cause: `tile_vram_size()`
+computes usable VRAM from two plain registers, not from the LMEM BAR
+itself:
+
+- `SG_TILE_ADDR_RANGE(0)` (`0x1083a0`): tile size and offset, in 1GB units
+  (`GENMASK(17,8)` / `GENMASK(7,1)`).
+- `XEHP_FLAT_CCS_BASE_ADDR` (`0x4910`, an MCR/steered register): offset (in
+  64K units) marking where flat-CCS compression metadata begins;
+  `usable_size = ccs_offset - tile_offset`.
+
+Both read `0` on our unmodified buffer, so `usable_size` computed to `0`,
+tripping `vram_region_init()`'s `!vram->io_size` check.
+
+Before implementing the MCR register, checked whether MCR steering
+requires modeling: read `rw_with_mcr_steering()` in `xe_gt_mcr.c`
+directly - it always writes a steering-selector register first (harmless,
+falls into our generic buffer) but the actual data read/write always
+happens at the register's own raw offset regardless of steering target.
+So no MCR-specific device logic is needed at all, just a normal register
+at `0x4910`.
+
+Added `hw/display/alchemist/alchemist_vram.c`, called once from
+`realize()` (not a write-triggered handler, like PCODE/forcewake - these
+are plain fixed-value registers, no request/response protocol). Reports a
+tile size of exactly 1GB (the smallest value the 1GB-granularity
+`SG_TILE_ADDR_RANGE` field can represent) with the flat-CCS base set to
+that same offset - i.e. no space reserved for CCS metadata, all of the
+(fictional) 1GB tile nominally usable.
+
+Since our real BAR2 is 256MB, smaller than that 1GB, `vram_region_init()`
+clamps usable size down to what's actually mapped and logs "Small BAR
+device." This is not a shortcut - it's DG2's real, documented behavior on
+hardware without Resizable BAR enabled (see the kernel's
+`Documentation/gpu/rfc/i915_small_bar.rst`), so exercising that exact
+codepath is arguably more faithful than inventing a fake 1GB+ BAR2 just to
+dodge it.
+
+### Evidence
+
+```
+[    2.779620] xe 0000:00:04.0: [drm] Small BAR device
+[    2.780558] xe 0000:00:04.0: [drm] VRAM[0]: Actual physical size 0x0000000040000000, usable size exclude stolen 0x0000000040000000, CPU accessible size 0x0000000010000000
+[    2.783275] xe 0000:00:04.0: [drm] VRAM[0]: DPA range: [0x0000000000000000-40000000], io range: [0x00000e0040000000-e0050000000]
+[    2.785397] xe 0000:00:04.0: [drm] VRAM: 0x0000000040000000 is larger than resource 0x0000000010000000
+[    2.793049] xe 0000:00:04.0: [drm] Display not present, disabling
+```
+
+Physical size (1GB), usable size (1GB), and CPU-accessible size (256MB)
+all read back exactly as computed. "Display not present, disabling" is
+expected and non-fatal - we haven't implemented any display/output
+registers, and none are required for probe success. Probe now advances to
+IRQ allocation:
+```
+[    2.800356] xe 0000:00:04.0: [drm] *ERROR* Failed to allocate IRQ vectors: -22
+[    2.801727] xe 0000:00:04.0: probe with driver xe failed with error -22
+```
+This is exactly Phase 6 (IRQ plumbing) from the original plan - our device
+has no MSI capability configured at all yet, so `pci_alloc_irq_vectors()`
+has nothing to allocate.

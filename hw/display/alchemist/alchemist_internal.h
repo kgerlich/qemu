@@ -42,4 +42,10 @@ static inline void alchemist_mmio_store32(AlchemistState *s, hwaddr addr,
 void alchemist_pcode_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
 void alchemist_forcewake_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
 
+/*
+ * Called once from realize() to pre-populate registers that just report a
+ * fixed value rather than reacting to guest writes.
+ */
+void alchemist_vram_init(AlchemistState *s);
+
 #endif
