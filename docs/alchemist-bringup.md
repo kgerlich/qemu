@@ -179,3 +179,52 @@ This is the real mailbox exchange completing correctly at the register
 level, not just an absence of the old error. Probe then advances to the
 next stage - forcewake - which Phase 3 covers.
 
+## Phase 3 — Forcewake domains
+
+The temporary MMIO tracing from Phase 2 turned out to be exactly the right
+tool for scoping this phase too: probe's next register access after PCODE
+is a write to `FORCEWAKE_GT` (`0xa188`) with value `0x10001`, followed by a
+tight poll of `0x130044` that never resolves. Cross-referencing
+`xe_force_wake.c`/`regs/xe_gt_regs.h` confirms this exactly: `0x130044` is
+`FORCEWAKE_ACK_GT`, and `0x10001` is precisely
+`FORCEWAKE_MT_MASK(FORCEWAKE_KERNEL) | FORCEWAKE_MT(FORCEWAKE_KERNEL)` -
+the masked-write convention used by every forcewake control register
+(bits `[31:16]` select which of bits `[15:0]` to update).
+
+Added `hw/display/alchemist/alchemist_forcewake.c`: a data-driven table of
+every control/ack register pair DG2-class `xe` defines - `GT`, `RENDER`,
+`GSC`, and the per-instance media decode (`VDBOX0-7`) and encode
+(`VEBOX0-3`) domains - transcribed directly from
+`xe_force_wake_init_gt()`/`xe_force_wake_init_engines()`. (Note: unlike
+older i915-generation hardware, `xe` has no separate "blitter" forcewake
+domain - the plan's original phrasing was based on i915-era terminology;
+DG2's copy engine doesn't have its own domain in `xe`.) Any write to a
+known control register applies the masked update and immediately mirrors
+the result into the paired ack register - there's no real power-gated
+hardware behind this device to model a wake delay for.
+
+### Evidence
+
+```
+[    2.917667] xe 0000:00:04.0: [drm] Unknown revid 0x08
+[    2.918871] xe 0000:00:04.0: [drm] Unknown revision 0x08
+[    2.920084] xe 0000:00:04.0: [drm] Found dg2/g11 (device ID 56a5) discrete display version 13.00 stepping **
+[    2.922394] xe 0000:00:04.0: [drm] VISIBLE VRAM: 0x00000e0040000000, 0x0000000010000000
+[    2.924206] xe 0000:00:04.0: [drm] *ERROR* Tile without any CPU visible VRAM. Aborting.
+```
+
+The forcewake stall is gone - probe now runs all the way through platform
+identification (correctly reading back "dg2/g11", exactly the subplatform
+we chose) and into VRAM probing, where it correctly reads our real BAR2
+address and 256MB size ("VISIBLE VRAM: ..., 0x10000000"). The "Unknown
+revid/revision 0x08" lines are cosmetic - our chosen PCI revision isn't in
+the driver's stepping lookup table - and not fatal.
+
+**New, previously unplanned finding**: `xe_vram_probe()` treats the tile as
+having no CPU-visible VRAM despite the BAR being correctly sized and
+mapped, meaning it derives "visible VRAM" from a dedicated LMEM-size
+register rather than (or in addition to) the BAR itself, and we haven't
+implemented that register yet. This wasn't in the original phase list -
+the plan's phases 4-7 covered GuC/IRQ/milestone, not VRAM register support.
+Next step is a short research pass on `xe_vram_probe()` to identify the
+exact register, added as an inserted phase before GuC.

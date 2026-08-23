@@ -40,5 +40,6 @@ static inline void alchemist_mmio_store32(AlchemistState *s, hwaddr addr,
  * read/write-what-was-written memory.
  */
 void alchemist_pcode_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
+void alchemist_forcewake_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
 
 #endif

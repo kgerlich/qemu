@@ -26,4 +26,27 @@
 #define   DGFX_GET_INIT_STATUS         0x0u
 #define   DGFX_INIT_STATUS_COMPLETE    0x1u
 
+/*
+ * Forcewake domains - drivers/gpu/drm/xe/regs/xe_gt_regs.h and
+ * xe_force_wake.c. Every control/ack register pair uses the same
+ * "masked write" convention: bits [31:16] of a write to the control
+ * register select which of bits [15:0] are being updated (see
+ * XE_REG_OPTION_MASKED in xe_reg_defs.h); the corresponding bit in the
+ * ack register mirrors that state once the domain is awake. xe only
+ * ever uses bit 0 (FORCEWAKE_KERNEL), but the masked-update logic here
+ * handles the general case, not just bit 0.
+ */
+#define ALCHEMIST_REG_FORCEWAKE_GT         0xa188
+#define ALCHEMIST_REG_FORCEWAKE_ACK_GT     0x130044
+#define ALCHEMIST_REG_FORCEWAKE_RENDER     0xa278
+#define ALCHEMIST_REG_FORCEWAKE_ACK_RENDER 0x000d84
+#define ALCHEMIST_REG_FORCEWAKE_GSC        0xa618
+#define ALCHEMIST_REG_FORCEWAKE_ACK_GSC    0x000df8
+/* FORCEWAKE_MEDIA_VDBOX(n) / FORCEWAKE_ACK_MEDIA_VDBOX(n), n = 0..7 */
+#define ALCHEMIST_REG_FORCEWAKE_MEDIA_VDBOX(n)     (0xa540 + (n) * 4)
+#define ALCHEMIST_REG_FORCEWAKE_ACK_MEDIA_VDBOX(n) (0x000d50 + (n) * 4)
+/* FORCEWAKE_MEDIA_VEBOX(n) / FORCEWAKE_ACK_MEDIA_VEBOX(n), n = 0..3 */
+#define ALCHEMIST_REG_FORCEWAKE_MEDIA_VEBOX(n)     (0xa560 + (n) * 4)
+#define ALCHEMIST_REG_FORCEWAKE_ACK_MEDIA_VEBOX(n) (0x000d70 + (n) * 4)
+
 #endif
