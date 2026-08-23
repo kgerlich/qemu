@@ -22,6 +22,7 @@
 #include "hw/pci/msi.h"
 #include "qom/object.h"
 #include "qemu/module.h"
+#include "qapi/error.h"
 #include "alchemist_internal.h"
 
 #define TYPE_PCI_ALCHEMIST_DEVICE "alchemist"
@@ -106,12 +107,27 @@ static void pci_alchemist_realize(PCIDevice *pdev, Error **errp)
     if (msi_init(pdev, 0, 1, true, false, errp)) {
         return;
     }
+
+    /*
+     * Non-fatal: nothing yet depends on the satellite process being up
+     * (see alchemist_guc_proc.c) - a device that works exactly as it did
+     * before this process existed is a better failure mode than losing
+     * the whole GPU device over it.
+     */
+    {
+        Error *local_err = NULL;
+
+        if (!alchemist_guc_proc_start(s, &local_err)) {
+            warn_report_err(local_err);
+        }
+    }
 }
 
 static void pci_alchemist_exit(PCIDevice *pdev)
 {
     AlchemistState *s = ALCHEMIST(pdev);
 
+    alchemist_guc_proc_stop(s);
     msi_uninit(pdev);
     g_free(s->mmio_buf);
 }

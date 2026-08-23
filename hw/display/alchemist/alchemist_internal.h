@@ -38,6 +38,18 @@ typedef struct AlchemistCtb {
     uint32_t ring_size_dwords;
 } AlchemistCtb;
 
+/*
+ * Satellite GuC coprocessor process - see alchemist_guc_proc.c. pid/qmp_fd
+ * are -1 whenever no process is running (both explicitly set that way by
+ * alchemist_guc_proc_start(), not relied on as a QOM zero-init default -
+ * fd 0 is a real, valid fd number).
+ */
+typedef struct AlchemistGucProc {
+    pid_t pid;
+    int qmp_fd;
+    char *qmp_path;
+} AlchemistGucProc;
+
 typedef struct AlchemistState {
     PCIDevice pdev;
     MemoryRegion mmio;
@@ -46,6 +58,7 @@ typedef struct AlchemistState {
     uint8_t *vram_ptr;
     AlchemistCtb h2g;
     AlchemistCtb g2h;
+    AlchemistGucProc guc_proc;
 } AlchemistState;
 
 static inline uint32_t alchemist_mmio_load32(AlchemistState *s, hwaddr addr)
@@ -119,5 +132,21 @@ void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
  */
 void alchemist_ctb_register(AlchemistState *s, uint16_t key, uint64_t val);
 void alchemist_ctb_check_h2g(AlchemistState *s);
+
+/*
+ * Satellite GuC coprocessor process - see alchemist_guc_proc.c. Launches a
+ * second qemu-system-x86_64 (-machine none -accel tcg -cpu 486, started
+ * halted with -S) that will eventually run GuC's real firmware, and
+ * QMP-controls it. Started once from realize(), stopped from exit() - the
+ * process exists for the PCI device's whole lifetime, the same way the
+ * real GuC die is powered whenever the card is, even though its boot ROM
+ * doesn't actually run until DMA_CTRL.START_DMA (a later phase).
+ *
+ * Failure to start is treated as non-fatal (logged, not propagated) since
+ * nothing yet depends on this process being up - it's not wired into any
+ * register behavior until the register-relay phase.
+ */
+bool alchemist_guc_proc_start(AlchemistState *s, Error **errp);
+void alchemist_guc_proc_stop(AlchemistState *s);
 
 #endif

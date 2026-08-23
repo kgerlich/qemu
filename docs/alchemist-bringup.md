@@ -660,3 +660,90 @@ to it, then waited for completion via a hardware fence - none of which
 is CTB/mailbox/firmware-load territory. Getting `probe` to fully succeed
 now needs at least minimal real engine/ring-buffer/context submission
 support, not another register fix in the areas this phase covered.
+
+## Phase 9a: satellite GuC coprocessor process (launch + QMP control)
+
+The command-submission stall above is being addressed two ways: a
+protocol-level fix (Phase 8, in progress separately) and, per direction,
+actually running GuC's real signed firmware rather than simulating its
+protocol behavior in C. Firmware execution needs a real CPU; embedding a
+second CPU object in this same process would force the whole VM onto TCG
+(QEMU's accelerator choice is per-process, not per-CPU -
+`current_accel()` in `accel/accel-system.c` returns a single
+`AccelState*` from `MachineState->accelerator`), losing KVM for the main
+guest. This phase instead launches a second, independent
+`qemu-system-x86_64` process - free to run its own `-accel tcg` - and
+proves QMP control of it works. It does not yet load firmware, run the
+satellite CPU, or relay register accesses.
+
+`hw/display/alchemist/alchemist_guc_proc.c` is new. `fork()` +
+`qemu_close_all_open_fd()` + `execv()` is the same convention
+`net/tap.c`'s `net_bridge_run_helper()`/`launch_script()` use for a
+long-lived helper process; the QMP client itself (connect, greeting,
+`qmp_capabilities` handshake) reuses QEMU's own JSON object model
+(`qobject_from_json`/`qobject_to_json`, `include/qobject/qjson.h`) the
+same way `tests/qtest/libqtest.c` drives a spawned QEMU from C. Launched
+from `realize()`, torn down from `exit()` - the process exists for the
+device's whole lifetime, the same way the real GuC die is powered
+whenever the card is, even though its boot ROM doesn't run until
+`DMA_CTRL.START_DMA` (a later phase). Launch failure is non-fatal
+(logged, not propagated) since nothing yet depends on the process being
+up.
+
+One real, non-obvious fix needed: `-machine none -cpu 486` alone fails
+CPU realize with `apic-id property was not initialized properly` -
+`none` doesn't run the generic x86 possible-CPU-list/APIC-ID machinery
+real machine types do, so `-cpu` can't auto-create a default CPU the way
+it does elsewhere. Confirmed directly against this build:
+```
+$ ./qemu-system-x86_64 -machine none -cpu 486 -nographic
+QEMU 11.1.50 monitor - type 'help' for more information
+qemu-system-x86_64: apic-id property was not initialized properly
+```
+Fixed by creating the CPU explicitly with its APIC ID set:
+`-nodefaults -device 486-x86_64-cpu,apic-id=0`, confirmed working:
+```
+$ ./qemu-system-x86_64 -machine none -nodefaults -device 486-x86_64-cpu,apic-id=0 -nographic
+(runs cleanly, no error)
+```
+
+### Evidence
+
+Booting the guest with the alchemist device attached now also spawns a
+second, correctly-parented `qemu-system-x86_64` process for the whole
+life of the main VM:
+```
+$ ps -ef | grep qemu-system
+kgerlich  693616       1  ...  qemu-system-x86_64 -M q35 ... -device alchemist,addr=04.0 ...
+kgerlich  693621  693616 ...  qemu-system-x86_64 -machine none -accel tcg -nodefaults \
+    -device 486-x86_64-cpu,apic-id=0 -m 16 \
+    -qmp unix:/tmp/alchemist-guc-qmp-693616-0x62e867eaa3e0.sock,server=on,wait=off \
+    -nographic -no-reboot -run-with exit-with-parent=on -S
+```
+
+A temporary trace (added then removed, per established practice) in
+`guc_proc_qmp_handshake()` confirmed the actual JSON exchange over that
+socket, captured during a real guest boot:
+```
+ALCHEMIST-TRACE: greeting: {"QMP": {"version": {"qemu": {"minor": 1, "micro": 50, "major": 11}, "package": ""}, "capabilities": ["oob"]}}
+ALCHEMIST-TRACE: qmp_capabilities reply: {"return": {}}
+ALCHEMIST-TRACE: query-status reply: {"return": {"status": "prelaunch", "running": false}}
+```
+(`query-status` was only sent for this trace, to independently confirm a
+second command/response round-trip beyond capabilities negotiation - it
+is not part of the committed code.) `running: false` confirms the
+satellite genuinely started halted (`-S`), matching the "coprocessor
+present but not yet told to boot" analogy.
+
+Both teardown paths verified independently:
+- Graceful: `kill -15` on the main VM (both a clean guest-triggered ACPI
+  poweroff and a manual `SIGTERM`) leaves no satellite process behind -
+  `pci_alchemist_exit()` -> `alchemist_guc_proc_stop()` sends
+  `{"execute":"quit"}`, then `waitpid()`s.
+- Hard failure: `kill -9` on the main VM (no chance for our own cleanup
+  code to run at all) also leaves no satellite process behind - the
+  `-run-with exit-with-parent=on` safety net catches this case
+  independently.
+
+In both cases confirmed via `ps -ef` showing zero matching processes
+immediately after.
