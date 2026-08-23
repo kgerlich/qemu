@@ -73,3 +73,74 @@ guest. Phase 0's goal (confirm a usable prebuilt kernel+driver+firmware
 before building anything ourselves) is satisfied by the box's own installed
 kernel. The guest boot setup (rootfs/initramfs matching this exact kernel's
 module ABI) is addressed as part of Phase 1's verification step.
+
+## Phase 1 — Branch + device skeleton: PCI identity and BAR0/BAR2
+
+Added `hw/display/alchemist/alchemist.c`: a minimal PCI device using DG2-G11's
+real device ID (`8086:56a5`, Arc A380), class `0x030000`, BAR0 (GTTMMADR)
+exactly 16MB (the floor `xe_mmio_probe_early()` checks before reading any
+register) backed by a plain read/write buffer, and BAR2 (GMADR/LMEM) as a
+256MB 64-bit prefetchable RAM region. No register has special behavior yet
+— everything on BAR0 is a generic buffer, so any offset just echoes back
+whatever was last written.
+
+### Guest boot setup
+
+Since the guest needs to load the box's *exact* `xe.ko` (kernel modules are
+build/ABI-specific, unlike the Alpine-based generic-kernel setup used for
+the earlier `invertram` lab), the guest rootfs is a minimal Ubuntu
+`resolute` chroot built with `debootstrap --variant=minbase --include=kmod`,
+augmented with:
+- The box's own `/lib/modules/7.0.0-30-generic/` tree (for `xe.ko` and its
+  dependency chain, resolved automatically by `modprobe` via the copied
+  `modules.dep`)
+- The box's own `/lib/firmware/i915/dg2_guc_70*.bin.zst` /
+  `dg2_huc_gsc.bin.zst` (real firmware, per the Phase 0 finding above)
+- `pciutils` (for `lspci -k` evidence), installed via `chroot` + `apt`
+- A small custom `/init` that loads `xe` with `force_probe=0x56a5`, then
+  dumps `dmesg`, `lspci -k`, and `/dev/dri`, then powers off via
+  `echo o > /proc/sysrq-trigger`
+
+Packaged as an initramfs and booted directly against the box's own kernel
+image (copied out from the root-only-readable `/boot/vmlinuz-7.0.0-30-generic`
+to a user-readable copy) with `-kernel`/`-initrd`, `-accel kvm -cpu host`,
+and our `alchemist` device attached.
+
+(One early snag, fixed in place: a first `cp -a` invocation flattened the
+copied module tree instead of preserving the `7.0.0-30-generic/`
+subdirectory, since the destination didn't exist yet — `modprobe` couldn't
+find `xe` at all until that was corrected.)
+
+### Evidence
+
+PCI identity and BAR layout, exactly as intended:
+```
+[    0.586742] pci 0000:00:04.0: [8086:56a5] type 00 class 0x030000 conventional PCI endpoint
+[    0.588840] pci 0000:00:04.0: BAR 0 [mem 0xe0000000000-0xe0000ffffff 64bit]
+[    0.589835] pci 0000:00:04.0: BAR 2 [mem 0xe0040000000-0xe004fffffff 64bit pref]
+[    1.297780] pci 0000:00:04.0: vgaarb: bridge control possible
+```
+
+`lspci -k` from inside the guest confirms both the real device identity
+(from the PCI ID database) and that both `i915` and `xe` recognize it:
+```
+00:04.0 VGA compatible controller: Intel Corporation DG2 [Arc A380] (rev 08)
+	Subsystem: Red Hat, Inc. Device 1100
+	Kernel modules: i915, xe
+```
+
+And the expected, predicted stall — `xe.force_probe=0x56a5` load runs the
+real driver's `xe_pcode_probe_early()` against our BAR0, which (since it's
+still just a plain buffer with no PCODE mailbox behavior yet) never clears
+the ready bit the driver polls for. After the real driver's own 3-minute
+timeout:
+```
+[  332.646533] xe 0000:00:04.0: [drm] *ERROR* PCODE initialization timedout after: 3 min
+[  332.648607] xe 0000:00:04.0: probe with driver xe failed with error -110
+```
+
+This confirms two things from the plan's research at once: the "3 minute"
+PCODE timeout constant, and that probe fails with `-110`/`ETIMEDOUT` exactly
+as expected — not a crash, not a different, unanticipated failure mode.
+This is the correct, well-scoped exit point for Phase 1; Phase 2 implements
+the PCODE mailbox handshake to get past it.

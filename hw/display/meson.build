@@ -143,3 +143,5 @@ endif
 system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
 modules += { 'hw-display': hw_display_modules }
+
+subdir('alchemist')
