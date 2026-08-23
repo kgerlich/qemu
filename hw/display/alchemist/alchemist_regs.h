@@ -115,4 +115,23 @@
  * of KLV entries configured) and 0 specifically as -ENOKEY. */
 #define GUC_ACTION_HOST2GUC_SELF_CFG        0x0508u
 
+/*
+ * GGTT (Global GTT) - xe_mmio.c documents BAR0 as registers (0-4MB),
+ * reserved (4-8MB), GGTT (8-16MB); xe_ggtt_init_early() confirms exactly
+ * that with `ggtt->gsm = tile->mmio.regs + SZ_8M`. PTEs are plain 8-byte
+ * MMIO stores at gsm[ggtt_addr >> XE_PTE_SHIFT] (xe_ggtt_set_pte()), so
+ * they already land correctly in our generic buffer - alchemist_ggtt.c
+ * only needs to decode them. Format is regs/xe_gtt_defs.h: bit 0 present,
+ * bit 1 XE_GGTT_PTE_DM (1 = address is a VRAM/BAR2 offset, 0 = a system
+ * RAM physical address), bits [51:12] the (4K-page-shifted) address - the
+ * 8MB GSM region sized for exactly 4GiB of GGTT space at 4K/PTE confirms
+ * the shift is 12, not e.g. a 64K-page variant.
+ */
+#define ALCHEMIST_GGTT_GSM_BASE      0x800000u   /* 8MB offset in BAR0 */
+#define ALCHEMIST_GGTT_PAGE_SHIFT    12
+#define ALCHEMIST_GGTT_PAGE_SIZE     (1u << ALCHEMIST_GGTT_PAGE_SHIFT)
+#define   XE_PAGE_PRESENT            (1ull << 0)
+#define   XE_GGTT_PTE_DM             (1ull << 1)
+#define   XE_PAGE_ADDR_MASK          0x000FFFFFFFFFF000ull  /* bits [51:12] */
+
 #endif

@@ -481,3 +481,64 @@ This prompted stepping back from per-register reactive fixes to map the
 actual remaining scope: CTB requires real address translation to guest
 memory (GGTT), which is a foundational capability, not another status
 register - covered in Phase 7 below.
+
+## Phase 7 — GGTT address translation
+
+Before writing any CTB code, mapped the exact remaining call chain
+(`xe_uc.c`, `xe_guc_ct.c`) rather than continuing to react to the next
+error: past CT-enable, `xe_uc_load_hw()` does a **second full GuC
+reload** (`xe_huc_upload` → `xe_guc_upload` → `xe_guc_enable_communication`
+→ `xe_guc_post_load_init` → `xe_guc_pc_start` → `xe_guc_rc_enable` → HuC
+auth → GSC load), and every step past CT-enable talks over the real CTB
+ring buffer, not the mmio mailbox from Phase 5b. The `GDRST` timeout is
+that second reload's own error-recovery fallback after CTB communication
+never completes - not an independent thing to fix.
+
+CTB buffers are guest-allocated BOs, referenced only by GGTT address
+(registered via the `SELF_CFG` calls Phase 5b already handles correctly).
+To read/write them we need real GGTT translation - confirmed directly
+against source, not assumed:
+
+- `xe_mmio.c` documents BAR0's own layout: registers `0-4MB`, reserved
+  `4-8MB`, **GGTT `8-16MB`** - inside the 16MB BAR0 we already have.
+- `xe_ggtt_init_early()` confirms exactly that: `ggtt->gsm = tile->mmio.regs + SZ_8M`.
+- `xe_ggtt_set_pte()` writes PTEs as plain 8-byte MMIO stores
+  (`writeq(pte, &ggtt->gsm[addr >> XE_PTE_SHIFT])`) - our generic buffer
+  already stores these correctly for free; translation is a pure
+  read-side decode, no write-side hook needed.
+- PTE format (`regs/xe_gtt_defs.h`): bit 0 present, bit 1
+  `XE_GGTT_PTE_DM` (1 = the address is a VRAM/BAR2 offset, 0 = a guest
+  system-RAM physical address), bits `[51:12]` the address itself. The
+  8MB GSM region sized for exactly 4GiB of GGTT space at 4K/PTE confirms
+  the shift is 12 (standard 4K pages), not a 64K-page variant.
+
+Added `hw/display/alchemist/alchemist_ggtt.c`: `alchemist_ggtt_read()`/
+`alchemist_ggtt_write()` walk a transfer **one page at a time** (never
+assuming GGTT-contiguous addresses map to physically-contiguous guest
+pages - a real correctness requirement, not paranoia, since a multi-page
+transfer that only translated the first page could silently corrupt data
+on any guest allocation that isn't physically contiguous), dispatching
+each page to either our own VRAM buffer (`memory_region_get_ram_ptr()`,
+cached once at realize time as `s->vram_ptr`) or real guest system RAM
+via `pci_dma_read()`/`pci_dma_write()` - the same PCI DMA API `edu.c`
+uses for its own toy DMA engine. Both return `false` (nothing silently
+substituted) if any page in the range is unmapped or the DMA itself
+fails.
+
+The `ALCHEMIST_MMIO_SIZE`/`ALCHEMIST_VRAM_SIZE` size constants and the
+`AlchemistState` struct moved from `alchemist.c` into
+`alchemist_internal.h` as part of this change, since GGTT translation
+needs both from a separate file - no behavior change, just making them
+genuinely shared rather than locally-defined-and-hoped-for-consistency.
+
+### Evidence
+
+This phase is pure infrastructure - nothing calls `alchemist_ggtt_read()`/
+`write()` yet, so it changes no observable behavior. Confirmed via a full
+rebuild and re-run of the existing boot test: identical stall point
+(`GuC reset timed out, GDRST=0x8`) as before this phase, i.e. no
+regression from the `AlchemistState`/size-constant refactor. The real,
+meaningful test of this code is Phase 8 (CTB), which will exercise it
+end-to-end against the actual driver - that is the point at which
+"GGTT translation works" becomes a verified claim rather than a
+carefully-reasoned-through one.

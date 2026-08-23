@@ -5,6 +5,7 @@ alchemist_ss.add(files(
   'alchemist_forcewake.c',
   'alchemist_vram.c',
   'alchemist_guc.c',
+  'alchemist_ggtt.c',
 ))
 
 system_ss.add_all(when: 'CONFIG_ALCHEMIST', if_true: alchemist_ss)

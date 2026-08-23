@@ -28,20 +28,6 @@
 DECLARE_INSTANCE_CHECKER(AlchemistState, ALCHEMIST,
                           TYPE_PCI_ALCHEMIST_DEVICE)
 
-/*
- * BAR0 (GTTMMADR): combined MMIO register space + Global GTT. The real xe
- * driver's xe_mmio_probe_early() rejects anything smaller than 16MB before
- * reading a single register, so this is a hard floor, not a tuning knob.
- */
-#define ALCHEMIST_MMIO_SIZE (16 * MiB)
-
-/*
- * BAR2 (GMADR): local-memory/VRAM aperture. Real DG2 cards expose several
- * GB here; we start intentionally small and revisit if a later phase's
- * VRAM-size probe rejects it.
- */
-#define ALCHEMIST_VRAM_SIZE (256 * MiB)
-
 /* DG2-G11 (Arc A380 desktop), the smallest die - see docs/alchemist-bringup.md */
 #define ALCHEMIST_PCI_DEVICE_ID 0x56a5
 #define ALCHEMIST_PCI_REVISION  0x08
@@ -94,6 +80,7 @@ static void pci_alchemist_realize(PCIDevice *pdev, Error **errp)
 
     memory_region_init_ram(&s->vram, OBJECT(s), "alchemist-vram",
                             ALCHEMIST_VRAM_SIZE, &error_fatal);
+    s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
     pci_register_bar(pdev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY |
                       PCI_BASE_ADDRESS_MEM_TYPE_64 |
                       PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
