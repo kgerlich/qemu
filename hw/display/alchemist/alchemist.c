@@ -19,6 +19,7 @@
 #include "qemu/units.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/msi.h"
 #include "qom/object.h"
 #include "qemu/module.h"
 #include "alchemist_internal.h"
@@ -95,12 +96,23 @@ static void pci_alchemist_realize(PCIDevice *pdev, Error **errp)
     pci_register_bar(pdev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY |
                       PCI_BASE_ADDRESS_MEM_TYPE_64 |
                       PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
+
+    /*
+     * xe_irq_install() falls back to a single plain MSI vector whenever
+     * pci_msix_vec_count() reports no MSI-X capability (-EINVAL) - see
+     * xe_irq_msix_init() upstream - so that's all we need to provide.
+     */
+    pci_config_set_interrupt_pin(pdev->config, 1);
+    if (msi_init(pdev, 0, 1, true, false, errp)) {
+        return;
+    }
 }
 
 static void pci_alchemist_exit(PCIDevice *pdev)
 {
     AlchemistState *s = ALCHEMIST(pdev);
 
+    msi_uninit(pdev);
     g_free(s->mmio_buf);
 }
 

@@ -290,3 +290,54 @@ IRQ allocation:
 This is exactly Phase 6 (IRQ plumbing) from the original plan - our device
 has no MSI capability configured at all yet, so `pci_alloc_irq_vectors()`
 has nothing to allocate.
+
+## Phase 6 — MSI interrupt support
+
+Checked `xe_irq_install()` first rather than assuming MSI-X was needed:
+`xe_irq_msix_init()` calls `pci_msix_vec_count(pdev)`, and when that
+returns `-EINVAL` (no MSI-X capability present at all) it returns `0`
+without error - `xe_device_has_msix()` then reports false, and
+`xe_irq_install()` falls back to a single plain MSI vector
+(`pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI)`). So no MSI-X modeling
+is needed at all, just one ordinary MSI vector.
+
+Added directly in `alchemist.c`'s `realize()`/`exit()` (small enough not
+to need its own file, mirroring how `edu.c` does it inline):
+`pci_config_set_interrupt_pin()` + `msi_init(pdev, 0, 1, true, false, errp)`,
+matched with `msi_uninit()` on exit.
+
+### Evidence
+
+```
+[    2.931056] xe 0000:00:04.0: [drm] Display not present, disabling
+[    2.941102] xe 0000:00:04.0: [drm] Interrupt register 0x444f8 is not zero: 0xffffffff
+[    2.942765] WARNING: drivers/gpu/drm/xe/xe_irq.c:49 at xe_irq_postinstall+0xdf/0x280 [xe], CPU#0: modprobe/73
+...
+[    3.042120] xe 0000:00:04.0: [drm] Tile0: GT0: Using GuC firmware from i915/dg2_guc_70.bin version 70.53.0
+[    3.077547] xe 0000:00:04.0: [drm] Failed to init uC WOPCM registers!
+[    3.078958] xe 0000:00:04.0: [drm] DMA_GUC_WOPCM_OFFSET(0xc340)=0x0
+[    3.080355] xe 0000:00:04.0: [drm] GUC_WOPCM_SIZE(0xc050)=0x3f3000
+[    3.081681] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-EINVAL)
+[    3.083413] xe 0000:00:04.0: probe with driver xe failed with error -22
+[    3.089969] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: GuC reset timed out, GDRST=0x8
+[    3.091861] xe 0000:00:04.0: [drm] *ERROR* Failed to reset GuC, ret = -110
+```
+
+`pci_alloc_irq_vectors()` now succeeds - no more "Failed to allocate IRQ
+vectors" error - and probe advances dramatically further: past VRAM,
+display, and into real GuC firmware loading. Notably, it picked up the
+**real** `i915/dg2_guc_70.bin version 70.53.0` from the box's own
+`linux-firmware`, exactly the Phase 0 finding paying off - no synthetic
+firmware blob was ever needed.
+
+There's a benign `xe_irq_postinstall` `WARN_ON` about interrupt register
+`0x444f8` not reading as zero at postinstall time (a soft warning, not a
+probe-ending failure by itself) worth investigating alongside the GuC
+work, since it's in the same interrupt-handling neighborhood.
+
+The real next blocker is GuC's WOPCM (Write-Once Protected Code Memory)
+register setup failing, which cascades into a GuC reset timeout. This is
+exactly the territory the original plan flagged as needing a dedicated
+research phase before writing code - GUC_WOPCM_SIZE/DMA_GUC_WOPCM_OFFSET
+semantics, the boot-status handshake, and (per the plan) potentially GuC
+CTB traffic during probe itself. Next step is that research spike.
