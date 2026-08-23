@@ -64,6 +64,7 @@ static void alchemist_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
     alchemist_pcode_mmio_write(s, addr, size);
     alchemist_forcewake_mmio_write(s, addr, size);
+    alchemist_guc_mmio_write(s, addr, size);
 }
 
 static const MemoryRegionOps alchemist_mmio_ops = {

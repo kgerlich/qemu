@@ -65,4 +65,23 @@
 #define ALCHEMIST_REG_XEHP_FLAT_CCS_BASE_ADDR 0x4910
 #define   XEHP_FLAT_CCS_PTR_SHIFT      8   /* GENMASK(31, 8), in 64K units */
 
+/*
+ * GuC firmware load - drivers/gpu/drm/xe/regs/xe_guc_regs.h and
+ * xe_wopcm.c/xe_uc_fw.c/xe_guc.c. See alchemist_guc.c for the handshake
+ * this implements.
+ */
+#define ALCHEMIST_REG_GUC_STATUS            0xc000
+#define   GS_AUTH_STATUS_GOOD               (0x2u << 30)
+#define   GS_UKERNEL_READY                  (0xF0u << 8)   /* XE_GUC_LOAD_STATUS_READY */
+#define   GS_BOOTROM_JUMP_PASSED            (0x76u << 1)   /* XE_BOOTROM_STATUS_JUMP_PASSED */
+
+#define ALCHEMIST_REG_GUC_WOPCM_SIZE        0xc050
+#define   GUC_WOPCM_SIZE_LOCKED             (1u << 0)
+
+#define ALCHEMIST_REG_DMA_CTRL              0xc314
+#define   START_DMA                         (1u << 0)
+
+#define ALCHEMIST_REG_DMA_GUC_WOPCM_OFFSET  0xc340
+#define   GUC_WOPCM_OFFSET_VALID            (1u << 0)
+
 #endif

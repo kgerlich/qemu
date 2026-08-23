@@ -341,3 +341,74 @@ exactly the territory the original plan flagged as needing a dedicated
 research phase before writing code - GUC_WOPCM_SIZE/DMA_GUC_WOPCM_OFFSET
 semantics, the boot-status handshake, and (per the plan) potentially GuC
 CTB traffic during probe itself. Next step is that research spike.
+
+## Phase 4/5 — GuC research spike + firmware load handshake
+
+Read `xe_wopcm.c`, `xe_uc_fw.c`, and `xe_guc.c` directly to resolve the
+plan's three open GuC unknowns:
+
+1. **`struct uc_css_header` layout** - moot. We use the box's real
+   `i915/dg2_guc_70.bin` (per the Phase 0 finding), so the driver's
+   own CSS-header parse just works; no synthetic blob was ever needed.
+2. **WOPCM register semantics** - `__wopcm_init_regs()`
+   (`xe_wopcm.c`) uses `xe_mmio_write32_and_verify()`: write the raw
+   value, then read back and require a status bit the guest never wrote
+   to be set - `GUC_WOPCM_SIZE` (`0xc050`) bit 0 (`LOCKED`) and
+   `DMA_GUC_WOPCM_OFFSET` (`0xc340`) bit 0 (`VALID`). Real hardware sets
+   these itself on write to confirm the partition took effect; our
+   device does the same.
+3. **Does GuC mailbox traffic happen during probe?** Confirmed yes -
+   `xe_guc_min_load_for_hwconfig()` calls `__xe_guc_upload()` (firmware
+   DMA + boot-status wait) first, then `xe_guc_hwconfig_init()` and
+   `xe_guc_enable_communication()` immediately after, all during normal
+   probe. Firmware boot and mailbox communication are sequential,
+   though, not interleaved - we can implement and verify them as two
+   separate steps.
+
+`uc_fw_xfer()` (`xe_uc_fw.c`) writes `DMA_ADDR_0/1`, `DMA_COPY_SIZE`
+(plain writes, no side effects needed), then `DMA_CTRL` (`0xc314`) - a
+masked-write register (same `[31:16]` mask / `[15:0]` data convention as
+forcewake) that starts the transfer via `START_DMA` (bit 0). Real
+hardware clears `START_DMA` once the transfer completes, which the guest
+polls for. `guc_wait_ucode()` then polls `GUC_STATUS` (`0xc000`) for the
+`GS_UKERNEL_MASK` field to read `XE_GUC_LOAD_STATUS_READY` (`0xF0`),
+bounded to 3 seconds (non-debug builds).
+
+Added `hw/display/alchemist/alchemist_guc.c`: on `GUC_WOPCM_SIZE`/
+`DMA_GUC_WOPCM_OFFSET` writes, OR in the confirmation bit before storing.
+On a `DMA_CTRL` write with `START_DMA` requested, apply the masked
+update, immediately clear `START_DMA` (there's nothing to actually
+transfer - the guest's own GGTT-mapped source and WOPCM destination are
+both within guest memory we don't touch), and set `GUC_STATUS` to
+booted+authenticated (`GS_AUTH_STATUS_GOOD | GS_UKERNEL_READY |
+GS_BOOTROM_JUMP_PASSED`) in the same step. As with PCODE, the driver
+itself never cryptographically verifies the firmware - that's delegated
+to hardware (us), so reporting success here isn't a shortcut around real
+validation, it's what a real chip's boot ROM result collapses to from
+the driver's point of view too.
+
+All the other registers `__xe_guc_upload()` touches along the way
+(`GUC_SHIM_CONTROL`, `GT_PM_CONFIG`, `PMINTRMSK`, `SOFT_SCRATCH(n)`
+params, `UOS_RSA_SCRATCH(n)`) are plain writes with no readback
+verification, so the existing generic buffer already handles them
+correctly with no new code.
+
+### Evidence
+
+```
+[    3.077277] xe 0000:00:04.0: [drm] Tile0: GT0: Using GuC firmware from i915/dg2_guc_70.bin version 70.53.0
+[    3.173030] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: GuC mmio request 0x4100: no reply 0x4100
+[    3.175328] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-ETIMEDOUT)
+```
+
+The WOPCM-init failure and the DMA-timeout error from before are both
+gone entirely - firmware DMA and the `GUC_STATUS` boot-ready handshake
+now complete cleanly using the real GuC firmware blob. Probe advances
+into GuC mailbox communication (`xe_guc_hwconfig_init()`'s "mmio
+request"), confirming open question 3 above empirically as well as by
+source reading. This mailbox protocol is the next thing to research and
+implement.
+
+(The `xe_irq_postinstall` "Interrupt register 0x444f8 is not zero"
+`WARN_ON` from Phase 6 is still present and still benign - noted again
+here since it's adjacent to this GuC work, not because it changed.)
