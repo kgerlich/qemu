@@ -6,6 +6,8 @@ alchemist_ss.add(files(
   'alchemist_vram.c',
   'alchemist_guc.c',
   'alchemist_ggtt.c',
+  'alchemist_irq.c',
+  'alchemist_ctb.c',
 ))
 
 system_ss.add_all(when: 'CONFIG_ALCHEMIST', if_true: alchemist_ss)

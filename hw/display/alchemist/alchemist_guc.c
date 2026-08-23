@@ -32,20 +32,34 @@
  *    VF_SW_FLAG(0..3), then writing GUC_HOST_INTERRUPT (any value, any
  *    write at all "rings the doorbell" - it's not a bit-flag register),
  *    then polling VF_SW_FLAG(0) for a GuC-origin response. We implement
- *    the protocol
- *    itself faithfully (real HXG header encoding, real response
- *    handshake), but for XE_GUC_ACTION_GET_HWCONFIG specifically we
- *    only answer the size-query correctly (a nonzero placeholder size -
+ *    the protocol itself faithfully (real HXG header encoding, real
+ *    response handshake), but for XE_GUC_ACTION_GET_HWCONFIG specifically
+ *    we only answer the size-query correctly (a nonzero placeholder size -
  *    xe_guc_hwconfig_init() hard-fails on a zero size) and otherwise
- *    just acknowledge success. Delivering the real hwconfig table
- *    content would mean writing it into a GGTT address the guest
- *    provides, which needs GGTT/GPU-address translation we haven't
- *    built - a real subsystem, not another small register fix. The
- *    guest's hwconfig buffer is therefore left as freshly-allocated
+ *    just acknowledge success. We deliberately don't deliver real
+ *    hwconfig table *content* on the follow-up copy request even though
+ *    we now have GGTT translation and could write bytes there: real
+ *    hwconfig content encodes real GPU capabilities (EU counts, cache
+ *    sizes, ...) we have no authentic values for, and fabricating a
+ *    plausible-looking entry would be exactly the kind of invented data
+ *    to avoid. The guest's hwconfig buffer is left as freshly-allocated
  *    zeroed memory, which xe_guc_hwconfig_lookup_u32()'s parser handles
- *    safely (reads as "zero attributes", not a crash) rather than
- *    something we're silently faking real content for. Flagged here
- *    and in docs/alchemist-bringup.md as a known, deliberate deferral.
+ *    safely (reads as "zero attributes", not a crash). Flagged here and
+ *    in docs/alchemist-bringup.md as a known, deliberate deferral.
+ *
+ *    GUC_ACTION_HOST2GUC_SELF_CFG additionally gets its key/value decoded
+ *    and handed to alchemist_ctb_register() (alchemist_ctb.c) - this is
+ *    how the guest tells us the CTB descriptor/ring GGTT addresses that
+ *    module needs.
+ *
+ * GUC_HOST_INTERRUPT is also the doorbell for CTB ring traffic once the
+ * guest has moved on from the mmio mailbox (xe_guc_notify() is reused
+ * for both - see alchemist_ctb.c's file comment), so every write here
+ * checks the H2G ring regardless of whether the mmio mailbox path found
+ * anything: after the mailbox answers a request it overwrites
+ * VF_SW_FLAG(0) with a RESPONSE-type message, so a later doorbell ring
+ * for a real CTB reason naturally reads as "not a fresh mmio request"
+ * and falls through correctly - no separate staleness tracking needed.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -92,36 +106,53 @@ void alchemist_guc_mmio_write(AlchemistState *s, hwaddr addr, unsigned size)
         return;
     }
 
+    if (addr == ALCHEMIST_REG_GDRST) {
+        alchemist_mmio_store32(s, addr, 0);
+        /* A real GuC-domain reset invalidates the previous boot state -
+         * xe_guc_reset() explicitly checks GS_MIA_IN_RESET is now set,
+         * and a later reload goes through the normal DMA_CTRL/GUC_STATUS
+         * handshake above to boot again. */
+        alchemist_mmio_store32(s, ALCHEMIST_REG_GUC_STATUS, GS_MIA_IN_RESET);
+        return;
+    }
+
     if (addr == ALCHEMIST_REG_GUC_HOST_INTERRUPT) {
-        uint32_t req0, type, action, resp0, data0 = 0;
+        uint32_t req0 = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(0));
+        uint32_t type = (req0 >> HXG_MSG_0_TYPE_SHIFT) & HXG_TYPE_MASK;
 
-        req0 = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(0));
-        type = (req0 >> HXG_MSG_0_TYPE_SHIFT) & HXG_TYPE_MASK;
-        action = req0 & HXG_REQUEST_MSG_0_ACTION_MASK;
+        if (type == HXG_TYPE_REQUEST) {
+            uint32_t action = req0 & HXG_REQUEST_MSG_0_ACTION_MASK;
+            uint32_t resp0, data0 = 0;
 
-        if (type != HXG_TYPE_REQUEST) {
-            return;
-        }
+            if (action == GUC_ACTION_GET_HWCONFIG) {
+                uint32_t ggtt_lo = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(1));
+                uint32_t ggtt_hi = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(2));
+                uint32_t req_size = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(3));
 
-        if (action == GUC_ACTION_GET_HWCONFIG) {
-            uint32_t ggtt_lo = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(1));
-            uint32_t ggtt_hi = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(2));
-            uint32_t req_size = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(3));
+                if (ggtt_lo == 0 && ggtt_hi == 0 && req_size == 0) {
+                    /* Size query: must be nonzero or xe_guc_hwconfig_init()
+                     * treats it as failure. See the file comment above for
+                     * why we don't deliver real table content. */
+                    data0 = 12;
+                }
+            } else if (action == GUC_ACTION_HOST2GUC_SELF_CFG) {
+                uint32_t word1 = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(1));
+                uint32_t word2 = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(2));
+                uint32_t word3 = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(3));
+                uint16_t key = (word1 >> 16) & 0xFFFFu;
+                uint64_t value = ((uint64_t)word3 << 32) | word2;
 
-            if (ggtt_lo == 0 && ggtt_hi == 0 && req_size == 0) {
-                /* Size query: must be nonzero or xe_guc_hwconfig_init()
-                 * treats it as failure. See the file comment above for
-                 * why we don't deliver real table content. */
-                data0 = 12;
+                alchemist_ctb_register(s, key, value);
+                data0 = 1;
             }
-        } else if (action == GUC_ACTION_HOST2GUC_SELF_CFG) {
-            data0 = 1;
+
+            resp0 = (HXG_ORIGIN_GUC << HXG_MSG_0_ORIGIN_SHIFT) |
+                    (HXG_TYPE_RESPONSE_SUCCESS << HXG_MSG_0_TYPE_SHIFT) |
+                    (data0 & HXG_RESPONSE_MSG_0_DATA0_MASK);
+            alchemist_mmio_store32(s, ALCHEMIST_REG_VF_SW_FLAG(0), resp0);
         }
 
-        resp0 = (HXG_ORIGIN_GUC << HXG_MSG_0_ORIGIN_SHIFT) |
-                (HXG_TYPE_RESPONSE_SUCCESS << HXG_MSG_0_TYPE_SHIFT) |
-                (data0 & HXG_RESPONSE_MSG_0_DATA0_MASK);
-        alchemist_mmio_store32(s, ALCHEMIST_REG_VF_SW_FLAG(0), resp0);
+        alchemist_ctb_check_h2g(s);
         return;
     }
 }

@@ -74,6 +74,7 @@
 #define   GS_AUTH_STATUS_GOOD               (0x2u << 30)
 #define   GS_UKERNEL_READY                  (0xF0u << 8)   /* XE_GUC_LOAD_STATUS_READY */
 #define   GS_BOOTROM_JUMP_PASSED            (0x76u << 1)   /* XE_BOOTROM_STATUS_JUMP_PASSED */
+#define   GS_MIA_IN_RESET                   (1u << 0)
 
 #define ALCHEMIST_REG_GUC_WOPCM_SIZE        0xc050
 #define   GUC_WOPCM_SIZE_LOCKED             (1u << 0)
@@ -83,6 +84,16 @@
 
 #define ALCHEMIST_REG_DMA_GUC_WOPCM_OFFSET  0xc340
 #define   GUC_WOPCM_OFFSET_VALID            (1u << 0)
+
+/* GDRST - regs/xe_gt_regs.h. Reset-domain trigger register (do_gt_reset()/
+ * xe_guc_reset() upstream write a domain bit and poll for hardware to
+ * clear it once that domain's reset completes); we have no real
+ * per-domain reset state to simulate, so clear immediately. xe_guc_reset()
+ * writes GRDOM_GUC (0x8) specifically and then checks GUC_STATUS for
+ * GS_MIA_IN_RESET - a real reset invalidates the whole prior boot state,
+ * so we reset GUC_STATUS to just that bit rather than OR it in. */
+#define ALCHEMIST_REG_GDRST                 0x941c
+#define   GRDOM_GUC                         (1u << 3)
 
 /*
  * GuC mmio mailbox (the "HXG" protocol) - abi/guc_messages_abi.h and
@@ -104,6 +115,8 @@
 #define HXG_MSG_0_TYPE_SHIFT                28
 #define   HXG_TYPE_MASK                     0x7u
 #define   HXG_TYPE_REQUEST                  0u
+#define   HXG_TYPE_EVENT                    1u
+#define   HXG_TYPE_FAST_REQUEST             2u
 #define   HXG_TYPE_RESPONSE_SUCCESS         7u
 #define HXG_REQUEST_MSG_0_ACTION_MASK       0xFFFFu
 #define HXG_RESPONSE_MSG_0_DATA0_MASK       0xFFFFFFFu   /* bits [27:0] */
@@ -133,5 +146,64 @@
 #define   XE_PAGE_PRESENT            (1ull << 0)
 #define   XE_GGTT_PTE_DM             (1ull << 1)
 #define   XE_PAGE_ADDR_MASK          0x000FFFFFFFFFF000ull  /* bits [51:12] */
+
+/*
+ * CTB (Command Transport Buffer) - abi/guc_communication_ctb_abi.h and
+ * abi/guc_klvs_abi.h. The guest registers descriptor/ring GGTT addresses
+ * for both directions via SELF_CFG (see alchemist_guc.c); this is the
+ * real ring-buffer protocol those addresses are for. See alchemist_ctb.c.
+ */
+#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY             0x0902u
+#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY  0x0903u
+#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY             0x0904u
+#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY             0x0905u
+#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY  0x0906u
+#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY             0x0907u
+
+/* struct guc_ct_buffer_desc - 64 bytes, but only the first 3 dwords are
+ * used: head/tail are ring offsets in DWORDS, updated head only by the
+ * receiver and tail only by the sender - so for H2G we own head and the
+ * guest owns tail; for G2H it's reversed. */
+#define CTB_DESC_OFF_HEAD    0
+#define CTB_DESC_OFF_TAIL    4
+#define CTB_DESC_OFF_STATUS  8
+
+#define CTB_MSG_0_FENCE_SHIFT       16
+#define CTB_MSG_0_FORMAT_SHIFT      12
+#define   CTB_FORMAT_HXG            0u
+#define CTB_MSG_0_NUM_DWORDS_MASK   0xFFu
+
+/*
+ * GT interrupt cascade - regs/xe_irq_regs.h. Real Intel GPUs route
+ * interrupts through several indirection levels (master enable -> a
+ * per-bank status word -> a select-then-read "identity" lookup for the
+ * specific source) rather than a flat status register. We only need to
+ * support one source so far - GuC2Host, bank 0 bit INTR_GUC - since we
+ * have no engines/submission implemented yet to raise anything else, but
+ * the mechanism itself (see alchemist_irq.c) is implemented for real:
+ * the driver's own dg1_irq_handler()/gt_engine_identity() walk exactly
+ * this cascade regardless of how many sources exist behind it.
+ */
+#define ALCHEMIST_REG_DG1_MSTR_TILE_INTR    0x190008
+#define   DG1_MSTR_IRQ                       (1u << 31)
+#define   DG1_MSTR_TILE0                     (1u << 0)
+
+#define ALCHEMIST_REG_GFX_MSTR_IRQ           0x190010
+#define   MASTER_IRQ                         (1u << 31)
+#define   GT_DW_IRQ0                         (1u << 0)
+
+#define ALCHEMIST_REG_GT_INTR_DW(bank)       (0x190018 + (bank) * 4)
+#define   INTR_GUC                           (1u << 25)
+
+#define ALCHEMIST_REG_IIR_REG_SELECTOR(bank) (0x190070 + (bank) * 4)
+#define ALCHEMIST_REG_INTR_IDENTITY_REG(bank) (0x190060 + (bank) * 4)
+#define   INTR_DATA_VALID                    (1u << 31)
+#define   INTR_ENGINE_INSTANCE_SHIFT         20
+#define   INTR_ENGINE_CLASS_SHIFT            16
+#define   XE_ENGINE_CLASS_OTHER              4u
+#define   OTHER_GUC_INSTANCE                 0u
+
+/* GUC_INTR_GUC2HOST - regs/xe_guc_regs.h */
+#define   GUC_INTR_GUC2HOST                  (1u << 15)
 
 #endif

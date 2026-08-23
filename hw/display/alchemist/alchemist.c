@@ -46,11 +46,23 @@ static void alchemist_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 {
     AlchemistState *s = opaque;
 
+    /*
+     * The GT interrupt status registers are write-1-to-clear, not plain
+     * memory - see alchemist_irq.c's file comment - so they're handled
+     * entirely by alchemist_irq_status_write() instead of the generic
+     * store every other register uses.
+     */
+    if (alchemist_irq_is_status_reg(addr)) {
+        alchemist_irq_status_write(s, addr, val);
+        return;
+    }
+
     memcpy(s->mmio_buf + addr, &val, size);
 
     alchemist_pcode_mmio_write(s, addr, size);
     alchemist_forcewake_mmio_write(s, addr, size);
     alchemist_guc_mmio_write(s, addr, size);
+    alchemist_irq_mmio_write(s, addr, size);
 }
 
 static const MemoryRegionOps alchemist_mmio_ops = {

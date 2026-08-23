@@ -542,3 +542,121 @@ meaningful test of this code is Phase 8 (CTB), which will exercise it
 end-to-end against the actual driver - that is the point at which
 "GGTT translation works" becomes a verified claim rather than a
 carefully-reasoned-through one.
+
+## Phase 8 — CTB (Command Transport Buffer) ring protocol
+
+Mapped the real ring format directly from `abi/guc_communication_ctb_abi.h`
+before writing anything: a 64-byte `struct guc_ct_buffer_desc`
+(head/tail/status, offsets in DWORDS - H2G head is receiver-owned (us),
+tail sender-owned (guest); reversed for G2H), and each ring message is a
+CTB header dword (FENCE/FORMAT/NUM_DWORDS) followed by an embedded HXG
+message - the *same* HXG format the mmio mailbox already uses, just
+delivered through guest memory instead of `VF_SW_FLAG` registers.
+
+The guest registers both rings' descriptor/ring GGTT addresses and sizes
+via `SELF_CFG` KLV keys (`abi/guc_klvs_abi.h`, `0x0902`-`0x0907`) - the
+mmio mailbox handler now decodes the actual key/value from each call
+(previously it just acknowledged generically) and hands it to
+`alchemist_ctb_register()`. `xe_guc_notify()` (`GUC_HOST_INTERRUPT`) is
+reused as the doorbell for *both* the mmio mailbox and CTB sends, so its
+handler now checks the H2G ring on every ring regardless of whether a
+fresh mmio request was also present - safe because answering an mmio
+request overwrites `VF_SW_FLAG(0)` with a RESPONSE-type message, so a
+later doorbell ring for a real CTB reason naturally reads as "not a
+fresh request" there.
+
+We only answer `HXG_TYPE_REQUEST` messages over CTB - `HXG_TYPE_EVENT`
+and `HXG_TYPE_FAST_REQUEST` are both explicitly documented
+(`guc_messages_abi.h`) as not expecting a response, so sending one would
+be protocol-incorrect.
+
+### The interrupt cascade (a real subsystem, not a shortcut)
+
+G2H delivery needs the guest to actually notice new data, and since our
+device reports real MSI as present, `ct_needs_safe_mode()` means the
+driver will *not* fall back to polling - we have to get real interrupt
+delivery right, not fake it. Real Intel GPUs route interrupts through
+several indirection levels rather than a flat status register - traced
+directly from `xe_irq.c` (`dg1_irq_handler`/`gt_irq_handler`/
+`gt_engine_identity`) and `regs/xe_irq_regs.h`:
+
+```
+DG1_MSTR_TILE_INTR (any tile pending?)
+  -> GFX_MSTR_IRQ (which category - GT banks, display, ...)
+    -> GT_INTR_DW(bank) (which specific source, e.g. GuC)
+      -> IIR_REG_SELECTOR(bank) / INTR_IDENTITY_REG(bank): guest writes
+         which bit it wants identified, polls for us to answer with an
+         encoded class/instance/vector
+```
+
+Added `hw/display/alchemist/alchemist_irq.c` implementing this for real,
+scoped to the one source we currently raise (GuC2Host, `XE_ENGINE_CLASS_OTHER`/
+`OTHER_GUC_INSTANCE`/`GUC_INTR_GUC2HOST`) - not a shortcut, since we have
+no engines/submission to raise anything else yet, but a source we don't
+recognize is handled the same way real hardware would (no
+`INTR_DATA_VALID` set, the driver's own ~100us poll timeout and a logged
+error, not a hang).
+
+`DG1_MSTR_TILE_INTR`/`GFX_MSTR_IRQ`/`GT_INTR_DW` are all write-1-to-clear
+(standard Intel ISR/IIR convention) - confirmed directly against
+`dg1_intr_disable()`'s write(0)-then-read-then-writeback pattern (a
+write of 0 changes nothing under strict W1C, which is exactly "sample
+the current level," not a special case). Because the generic
+store-then-react dispatch every other register uses would store the
+*written* value as if it were the new register value (wrong for W1C),
+these three addresses are routed around it entirely via
+`alchemist_irq_is_status_reg()`/`alchemist_irq_status_write()` in
+`alchemist.c`'s dispatch, straight to real read-modify-write W1C logic.
+
+### Debugging: two real bugs found via tracing, not guessed
+
+Added `hw/display/alchemist/alchemist_ctb.c`, wired the SELF_CFG capture
+and H2G-ring check into the doorbell handler, and booted - it made no
+observable difference at all versus before CTB existed, same stall at
+the same ~13s mark. Re-added the same host-side MMIO tracing technique
+used twice before (temporary, removed before committing) and found:
+
+1. **CT-enable itself was already succeeding even before this phase** -
+   `guc_ct_control_toggle()`'s response check tolerates `data0=0`, which
+   the old generic mmio-mailbox default already provided. The real
+   stall was later, and CTB traffic doesn't explain it: the trace showed
+   registration completing normally, then **total silence** for the
+   rest of the run - nothing sent over either the mailbox or the ring.
+2. Extending the trace to catch the *entire* address range in play
+   (`0xc000-0xc400`, `0x190000-0x1a0000`, plus `GDRST` once its offset
+   was looked up) all the way through to the actual failure showed the
+   real cause: `GDRST` (`0x941c`) gets written with `0x8`
+   (`xe_guc_reset()`'s `GRDOM_GUC`) and polled for hardware to clear it -
+   exactly the same "write triggers an action, real hardware completes
+   it and clears the trigger bit" pattern as `DMA_CTRL`, which we simply
+   hadn't implemented for this register yet.
+
+Fixed by clearing `GDRST` immediately on write (`hw/display/alchemist/alchemist_guc.c`).
+That surfaced a second, more specific check one layer deeper:
+`xe_guc_reset()` reads `GUC_STATUS` afterward and requires `GS_MIA_IN_RESET`
+set - a real domain reset invalidates the whole prior boot state, so
+rather than OR the bit in we reset `GUC_STATUS` to just that bit,
+consistent with "everything else needs to be re-established via a fresh
+DMA_CTRL/GUC_STATUS boot handshake," which the existing Phase 5 handler
+already supports unchanged.
+
+### Evidence
+
+The WOPCM/DMA/mailbox/CTB/GDRST chain is now completely clean - no
+errors anywhere in that machinery. Probe advances substantially further,
+through interrupt-mask setup for every engine class and into real
+command submission:
+```
+[   17.300272] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: hwe rcs0: emit_wa_job failed (-ETIME) guc_id=1
+[   17.302597] xe 0000:00:04.0: probe with driver xe failed with error -62
+[   17.305242] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: GuC RC enable mode=0 failed: -ENODEV
+[   17.309233] xe 0000:00:04.0: [drm] Tile0: GT0: Kernel-submitted job timed out
+```
+
+This is a qualitatively different, new subsystem: the driver has
+registered a real GuC-scheduled context (`guc_id=1`) for the render
+engine (`rcs0`) and submitted an actual workaround-application batch job
+to it, then waited for completion via a hardware fence - none of which
+is CTB/mailbox/firmware-load territory. Getting `probe` to fully succeed
+now needs at least minimal real engine/ring-buffer/context submission
+support, not another register fix in the areas this phase covered.
