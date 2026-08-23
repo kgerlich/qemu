@@ -144,3 +144,38 @@ PCODE timeout constant, and that probe fails with `-110`/`ETIMEDOUT` exactly
 as expected — not a crash, not a different, unanticipated failure mode.
 This is the correct, well-scoped exit point for Phase 1; Phase 2 implements
 the PCODE mailbox handshake to get past it.
+
+## Phase 2 — PCODE mailbox handshake
+
+Added `hw/display/alchemist/alchemist_pcode.c`, implementing the exact
+protocol read directly from `xe_pcode.c`/`xe_pcode_api.h` upstream (not
+guessed): the guest writes `PCODE_DATA0`/`PCODE_DATA1` (offsets `0x138128`/
+`0x13812c`), then `PCODE_MAILBOX` (`0x138124`) with `PCODE_READY` (bit 31)
+set and the mailbox command in the low byte. We only answer the exact
+request `xe_pcode_ready()` sends during probe - `DGFX_GET_INIT_STATUS`
+(`0x0`) on the `DGFX_PCODE_STATUS` (`0x7E`) mailbox - by writing
+`DGFX_INIT_STATUS_COMPLETE` (`0x1`) into `PCODE_DATA0` and clearing
+`PCODE_MAILBOX` to `PCODE_SUCCESS` (`0x0`). Any other mailbox command is
+deliberately left unanswered (`PCODE_READY` stays set) rather than
+blanket-acknowledged, so an unexpected command stalling out stays useful
+signal for a future phase instead of being silently papered over.
+
+### Evidence
+
+Re-ran the exact same guest boot as Phase 1. The 3-minute PCODE timeout is
+gone entirely, and probe advances past it - confirmed both by the absence
+of the Phase 1 error and, precisely, by adding temporary host-side MMIO
+read/write tracing to the device (removed before this commit) to watch the
+actual register exchange:
+```
+write addr=0x138128 val=0x0        # PCODE_DATA0 = DGFX_GET_INIT_STATUS
+write addr=0x13812c val=0x0        # PCODE_DATA1 = 0
+write addr=0x138124 val=0x8000007e # PCODE_MAILBOX = PCODE_READY | DGFX_PCODE_STATUS
+read  addr=0x138124 val=0x0        # PCODE_READY now clear
+read  addr=0x138128 val=0x1        # PCODE_DATA0 == DGFX_INIT_STATUS_COMPLETE
+read  addr=0x138124 val=0x0
+```
+This is the real mailbox exchange completing correctly at the register
+level, not just an absence of the old error. Probe then advances to the
+next stage - forcewake - which Phase 3 covers.
+

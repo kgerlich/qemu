@@ -9,8 +9,7 @@
  * This file holds the PCI device core: identity, BAR setup, and the
  * top-level MMIO dispatcher. Phase-specific register behavior (PCODE
  * mailbox, forcewake, GuC firmware handshake, ...) lives in sibling files
- * and is wired into alchemist_mmio_read()/alchemist_mmio_write() as each
- * phase lands.
+ * and is wired into alchemist_mmio_write() as each phase lands.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -22,9 +21,9 @@
 #include "hw/pci/pci_device.h"
 #include "qom/object.h"
 #include "qemu/module.h"
+#include "alchemist_internal.h"
 
 #define TYPE_PCI_ALCHEMIST_DEVICE "alchemist"
-typedef struct AlchemistState AlchemistState;
 DECLARE_INSTANCE_CHECKER(AlchemistState, ALCHEMIST,
                           TYPE_PCI_ALCHEMIST_DEVICE)
 
@@ -46,13 +45,6 @@ DECLARE_INSTANCE_CHECKER(AlchemistState, ALCHEMIST,
 #define ALCHEMIST_PCI_DEVICE_ID 0x56a5
 #define ALCHEMIST_PCI_REVISION  0x08
 
-struct AlchemistState {
-    PCIDevice pdev;
-    MemoryRegion mmio;
-    MemoryRegion vram;
-    uint8_t *mmio_buf;
-};
-
 static uint64_t alchemist_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     AlchemistState *s = opaque;
@@ -68,6 +60,8 @@ static void alchemist_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     AlchemistState *s = opaque;
 
     memcpy(s->mmio_buf + addr, &val, size);
+
+    alchemist_pcode_mmio_write(s, addr, size);
 }
 
 static const MemoryRegionOps alchemist_mmio_ops = {
