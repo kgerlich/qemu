@@ -1,8 +1,9 @@
 /*
  * Intel Arc "Alchemist" (DG2) GPU simulation - GuC firmware load handshake
+ * and mmio mailbox
  *
- * Two write-triggered behaviors, both transcribed directly from
- * xe_wopcm.c/xe_uc_fw.c upstream:
+ * Three write-triggered behaviors. The first two (WOPCM, DMA_CTRL) are
+ * transcribed directly from xe_wopcm.c/xe_uc_fw.c upstream:
  *
  * 1. WOPCM partition registers (xe_wopcm.c __wopcm_init_regs()): the guest
  *    writes the computed size/offset and then reads the register back,
@@ -24,6 +25,27 @@
  *    firmware cryptographically - that's delegated to hardware, which is
  *    us, and reporting success here isn't a shortcut around real
  *    driver-side validation.
+ *
+ * 3. The GuC mmio mailbox (xe_guc.c xe_guc_mmio_send_recv(), abi/
+ *    guc_messages_abi.h "HXG" protocol): once booted, the guest and GuC
+ *    exchange request/response messages by writing a request into
+ *    VF_SW_FLAG(0..3), then writing GUC_HOST_INTERRUPT (any value, any
+ *    write at all "rings the doorbell" - it's not a bit-flag register),
+ *    then polling VF_SW_FLAG(0) for a GuC-origin response. We implement
+ *    the protocol
+ *    itself faithfully (real HXG header encoding, real response
+ *    handshake), but for XE_GUC_ACTION_GET_HWCONFIG specifically we
+ *    only answer the size-query correctly (a nonzero placeholder size -
+ *    xe_guc_hwconfig_init() hard-fails on a zero size) and otherwise
+ *    just acknowledge success. Delivering the real hwconfig table
+ *    content would mean writing it into a GGTT address the guest
+ *    provides, which needs GGTT/GPU-address translation we haven't
+ *    built - a real subsystem, not another small register fix. The
+ *    guest's hwconfig buffer is therefore left as freshly-allocated
+ *    zeroed memory, which xe_guc_hwconfig_lookup_u32()'s parser handles
+ *    safely (reads as "zero attributes", not a crash) rather than
+ *    something we're silently faking real content for. Flagged here
+ *    and in docs/alchemist-bringup.md as a known, deliberate deferral.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -67,6 +89,39 @@ void alchemist_guc_mmio_write(AlchemistState *s, hwaddr addr, unsigned size)
         alchemist_mmio_store32(s, ALCHEMIST_REG_GUC_STATUS,
                                 GS_AUTH_STATUS_GOOD | GS_UKERNEL_READY |
                                 GS_BOOTROM_JUMP_PASSED);
+        return;
+    }
+
+    if (addr == ALCHEMIST_REG_GUC_HOST_INTERRUPT) {
+        uint32_t req0, type, action, resp0, data0 = 0;
+
+        req0 = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(0));
+        type = (req0 >> HXG_MSG_0_TYPE_SHIFT) & HXG_TYPE_MASK;
+        action = req0 & HXG_REQUEST_MSG_0_ACTION_MASK;
+
+        if (type != HXG_TYPE_REQUEST) {
+            return;
+        }
+
+        if (action == GUC_ACTION_GET_HWCONFIG) {
+            uint32_t ggtt_lo = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(1));
+            uint32_t ggtt_hi = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(2));
+            uint32_t req_size = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(3));
+
+            if (ggtt_lo == 0 && ggtt_hi == 0 && req_size == 0) {
+                /* Size query: must be nonzero or xe_guc_hwconfig_init()
+                 * treats it as failure. See the file comment above for
+                 * why we don't deliver real table content. */
+                data0 = 12;
+            }
+        } else if (action == GUC_ACTION_HOST2GUC_SELF_CFG) {
+            data0 = 1;
+        }
+
+        resp0 = (HXG_ORIGIN_GUC << HXG_MSG_0_ORIGIN_SHIFT) |
+                (HXG_TYPE_RESPONSE_SUCCESS << HXG_MSG_0_TYPE_SHIFT) |
+                (data0 & HXG_RESPONSE_MSG_0_DATA0_MASK);
+        alchemist_mmio_store32(s, ALCHEMIST_REG_VF_SW_FLAG(0), resp0);
         return;
     }
 }

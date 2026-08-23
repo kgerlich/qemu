@@ -84,4 +84,35 @@
 #define ALCHEMIST_REG_DMA_GUC_WOPCM_OFFSET  0xc340
 #define   GUC_WOPCM_OFFSET_VALID            (1u << 0)
 
+/*
+ * GuC mmio mailbox (the "HXG" protocol) - abi/guc_messages_abi.h and
+ * xe_guc.c's xe_guc_mmio_send_recv(). Distinct from the DMA/boot-status
+ * registers above: this is how the host and GuC firmware exchange
+ * request/response messages once GuC has booted. See alchemist_guc.c.
+ */
+/* xe_guc_notify() writes the main GT's "notify_reg", GUC_HOST_INTERRUPT -
+ * any write at all (the value is always 0) rings the doorbell, it's not a
+ * bit-flag register like GUC_SEND_INTERRUPT (which xe's own notify path
+ * doesn't actually use, despite the similar name). */
+#define ALCHEMIST_REG_GUC_HOST_INTERRUPT    0x1901f0
+
+/* VF_SW_FLAG(n), n = 0..3 - request written here, response read back here. */
+#define ALCHEMIST_REG_VF_SW_FLAG(n)         (0x190240 + (n) * 4)
+
+#define HXG_MSG_0_ORIGIN_SHIFT              31
+#define   HXG_ORIGIN_GUC                    1u
+#define HXG_MSG_0_TYPE_SHIFT                28
+#define   HXG_TYPE_MASK                     0x7u
+#define   HXG_TYPE_REQUEST                  0u
+#define   HXG_TYPE_RESPONSE_SUCCESS         7u
+#define HXG_REQUEST_MSG_0_ACTION_MASK       0xFFFFu
+#define HXG_RESPONSE_MSG_0_DATA0_MASK       0xFFFFFFFu   /* bits [27:0] */
+
+/* XE_GUC_ACTION_GET_HWCONFIG - abi/guc_actions_abi.h */
+#define GUC_ACTION_GET_HWCONFIG             0x4100u
+/* GUC_ACTION_HOST2GUC_SELF_CFG - abi/guc_actions_abi.h. guc_self_cfg()
+ * (xe_guc.c) treats a response data0 of exactly 1 as success (the count
+ * of KLV entries configured) and 0 specifically as -ENOKEY. */
+#define GUC_ACTION_HOST2GUC_SELF_CFG        0x0508u
+
 #endif

@@ -412,3 +412,72 @@ implement.
 (The `xe_irq_postinstall` "Interrupt register 0x444f8 is not zero"
 `WARN_ON` from Phase 6 is still present and still benign - noted again
 here since it's adjacent to this GuC work, not because it changed.)
+
+## Phase 5b — GuC mmio mailbox (HXG protocol)
+
+Once firmware boots, probe advances into GuC *mailbox* communication -
+a distinct protocol from the DMA/boot-status registers above. Diagnosed
+with the same host-side MMIO tracing technique used for Phase 3's
+forcewake stall (added temporarily, removed before committing):
+
+- The guest encodes a request in `xe_guc_mmio_send_recv()`
+  (`abi/guc_messages_abi.h`'s "HXG" format) into `VF_SW_FLAG(0..3)`
+  (`0x190240`+), then writes `xe_guc_notify()`'s `notify_reg`. First
+  guess (`GUC_SEND_INTERRUPT`, `0xc4c8`) was wrong - tracing showed the
+  guest never touched it. Reading `xe_guc_notify()` directly showed the
+  real register: `GUC_HOST_INTERRUPT` (`0x1901f0`), for the main GT - and
+  it's not a bit-flag register, *any* write at all rings the doorbell.
+- The guest then polls `VF_SW_FLAG(0)` for a GuC-origin response.
+
+Added the mailbox handler to `hw/display/alchemist/alchemist_guc.c`
+(same file as the firmware/WOPCM handshake - same "GuC" domain): decodes
+the HXG request header, and for two actions we know the driver sends
+during probe:
+
+- `XE_GUC_ACTION_GET_HWCONFIG` (`0x4100`): the driver first asks for the
+  hwconfig table's *size* (a zero ggtt-address/zero-size request); we
+  answer with a nonzero placeholder (`xe_guc_hwconfig_init()` hard-fails
+  on a zero size). We do **not** deliver real table content on the
+  follow-up copy request - that needs writing bytes into a GGTT address
+  the guest provides, which needs GGTT translation (see Phase 7 below).
+  The guest's hwconfig buffer is left as freshly-allocated zeroed guest
+  memory, which `xe_guc_hwconfig_lookup_u32()`'s parser reads safely as
+  "zero attributes" rather than crashing - a deliberate, documented
+  deferral, not silently faked content.
+- `GUC_ACTION_HOST2GUC_SELF_CFG` (`0x0508`): used to tell GuC the CTB
+  descriptor/ring GGTT addresses. First attempt answered these (and
+  everything else) with a generic `data0=0` success - which broke this
+  action specifically: `guc_self_cfg()` (`xe_guc.c`) treats a response
+  `data0` of exactly `0` as **failure** (`-ENOKEY`), not `1` (a count of
+  configured KLV entries, per its own success path). Fixed by
+  special-casing `data0=1` for this action.
+
+### Evidence
+
+Before the `GUC_HOST_INTERRUPT` fix, nothing happened at all - the
+notify register the driver actually used was silently absorbed as a
+plain buffer write, so the driver polled forever:
+```
+xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: GuC mmio request 0x4100: no reply 0x4100
+xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-ETIMEDOUT)
+```
+After the notify-register fix but before the SELF_CFG `data0` fix:
+```
+xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: Failed to enable GuC CT (-ENOKEY)
+xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-ENOKEY)
+```
+With both fixes, GuC mailbox communication completes cleanly - no more
+mmio timeout or `-ENOKEY`, and probe advances into engine/topology
+enumeration (all engines log "fused off", which is expected/correct: we
+haven't implemented any of the fuse-mask registers, so every optional
+engine reads as absent, same as a real minimal-fuse SKU would) and then
+into the **real CTB (Command Transport Buffer) ring protocol** - a
+different, larger communication mechanism the mmio mailbox above only
+bootstraps. That surfaces as a new stall (`GuC reset timed out,
+GDRST=0x8`, a downstream symptom of CTB communication never completing,
+not a new independent register to fix) roughly 13 seconds later.
+
+This prompted stepping back from per-register reactive fixes to map the
+actual remaining scope: CTB requires real address translation to guest
+memory (GGTT), which is a foundational capability, not another status
+register - covered in Phase 7 below.
