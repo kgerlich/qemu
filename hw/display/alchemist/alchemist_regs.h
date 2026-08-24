@@ -206,4 +206,68 @@
 /* GUC_INTR_GUC2HOST - regs/xe_guc_regs.h */
 #define   GUC_INTR_GUC2HOST                  (1u << 15)
 
+/*
+ * RCS0 (render engine) completion interrupt - same bank-0 GT_INTR_DW
+ * cascade as GuC2Host above, a different bit/identity. XE_ENGINE_CLASS_RENDER
+ * and GT_MI_USER_INTERRUPT - xe_hw_engine_types.h / regs/xe_irq_regs.h.
+ */
+#define   INTR_RCS0                          (1u << 0)
+#define   XE_ENGINE_CLASS_RENDER             0u
+#define   GT_MI_USER_INTERRUPT               (1u << 0)
+
+/*
+ * GuC context registration/scheduling actions - abi/guc_actions_abi.h.
+ * Payloads transcribed from xe_guc_submit.c (__register_exec_queue(),
+ * submit_exec_queue(), MAKE_SCHED_CONTEXT_ACTION()) - see alchemist_submit.c.
+ */
+#define GUC_ACTION_REGISTER_CONTEXT              0x4502u
+#define XE_GUC_ACTION_SCHED_CONTEXT               0x1000u
+#define XE_GUC_ACTION_SCHED_CONTEXT_MODE_SET      0x1001u
+#define XE_GUC_ACTION_SCHED_CONTEXT_MODE_DONE     0x1002u
+#define   GUC_CONTEXT_DISABLE                     0u
+#define   GUC_CONTEXT_ENABLE                      1u
+
+/*
+ * LRC (Logical Ring Context) layout - regs/xe_lrc_layout.h. The engine
+ * register-state image starts LRC_PPHWSP_SIZE past the LRC's own GGTT
+ * address (which is the PPHWSP address, xe_lrc_ggtt_addr()); ring
+ * head/tail/start/ctl are fixed dword offsets within that image.
+ */
+#define LRC_PPHWSP_SIZE                     0x1000u
+#define CTX_RING_HEAD_OFF                   0x14u   /* dword (0x04+1) */
+#define CTX_RING_TAIL_OFF                   0x1Cu   /* dword (0x06+1) */
+#define CTX_RING_START_OFF                  0x24u   /* dword (0x08+1) */
+#define CTX_RING_CTL_OFF                    0x2Cu   /* dword (0x0a+1) */
+/* regs/xe_engine_regs.h RING_HEAD/RING_TAIL - HEAD is 4-byte, TAIL 8-byte
+ * aligned; both are byte offsets into the ring, not dword indices. */
+#define RING_HEAD_ADDR_MASK                 0x1FFFFCu
+#define RING_TAIL_ADDR_MASK                 0x1FFFF8u
+#define RING_CTL_VALID                      1u
+
+/*
+ * xe_lrc_descriptor()'s low bits (LRC_VALID/ADDRESSING_MODE/PRIVILEGE) -
+ * xe_lrc.c - mask off to recover the plain page-aligned PPHWSP GGTT
+ * address the REGISTER_CONTEXT hwlrca_lo/hi fields carry.
+ */
+#define LRC_DESC_ADDR_MASK                  0xFFFFFFFFFFFFF000ULL
+
+/*
+ * The literal MI-instruction ring epilogue every submitted job ends with
+ * (xe_ring_ops.c __emit_job_gen12_render_compute(): emit_pipe_imm_ggtt()
+ * + emit_user_interrupt()) - see alchemist_submit.c. Recognizing this
+ * fixed 9-dword tail, rather than interpreting the whole ring/batch, is
+ * enough to signal completion correctly.
+ */
+#define MI_EPILOGUE_DWORDS                  9u
+/* xe_lrc_write_ring() QWORD-aligns the ring tail with an MI_NOOP pad
+ * when needed (9 dwords isn't a multiple of 2) - tolerate that. */
+#define MI_EPILOGUE_PAD_TOLERANCE           2u
+#define GFX_OP_PIPE_CONTROL_LEN6            0x7A000004u
+#define PIPE_CONTROL_BREADCRUMB_FLAGS \
+    (0x01000000u /* GLOBAL_GTT_IVB */ | 0x00004000u /* QW_WRITE */ | \
+     0x00000080u /* FLUSH_ENABLE */   | 0x00100000u /* CS_STALL */)
+#define MI_USER_INTERRUPT                   0x01000000u
+#define MI_ARB_ON_OFF_ENABLE                0x04000001u
+#define MI_ARB_CHECK                        0x02800000u
+
 #endif

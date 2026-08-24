@@ -16,10 +16,15 @@
  * message - the same HXG format already used by the mmio mailbox, just
  * delivered through guest memory instead of VF_SW_FLAG registers.
  *
- * We only answer HXG_TYPE_REQUEST messages - HXG_TYPE_EVENT and
- * HXG_TYPE_FAST_REQUEST are both explicitly documented (guc_messages_abi.h)
- * as not expecting a response at all, so sending one would be protocol-
- * incorrect, not just unnecessary.
+ * We only ever send a synchronous CTB reply for HXG_TYPE_REQUEST messages
+ * - HXG_TYPE_EVENT and HXG_TYPE_FAST_REQUEST are both explicitly
+ * documented (guc_messages_abi.h) as not expecting one, so sending one
+ * would be protocol-incorrect, not just unnecessary. FAST_REQUEST/EVENT
+ * messages with a recognized action are instead handed to
+ * alchemist_submit.c (context registration/scheduling - see its file
+ * comment), which may itself later send an *unsolicited* G2H event (e.g.
+ * SCHED_CONTEXT_MODE_DONE) via alchemist_ctb_send_sched_context_mode_done()
+ * below - a real, separate wire message, not a reply to this one.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -100,10 +105,9 @@ void alchemist_ctb_register(AlchemistState *s, uint16_t key, uint64_t val)
     }
 }
 
-static void alchemist_ctb_send_g2h(AlchemistState *s, uint32_t fence,
-                                    uint32_t hxg_response_word)
+static void ctb_g2h_send(AlchemistState *s, const uint32_t *msg, uint32_t n)
 {
-    uint32_t tail, new_tail, msg[2];
+    uint32_t tail, new_tail;
 
     if (s->g2h.ring_size_dwords == 0) {
         return;
@@ -111,18 +115,52 @@ static void alchemist_ctb_send_g2h(AlchemistState *s, uint32_t fence,
 
     tail = ctb_desc_read32(s, s->g2h.desc_addr, CTB_DESC_OFF_TAIL);
 
+    ctb_ring_write_dwords(s, s->g2h.ring_addr, s->g2h.ring_size_dwords,
+                           tail, msg, n);
+
+    new_tail = (tail + n) % s->g2h.ring_size_dwords;
+    ctb_desc_write32(s, s->g2h.desc_addr, CTB_DESC_OFF_TAIL, new_tail);
+
+    alchemist_irq_raise_guc2host(s);
+}
+
+static void alchemist_ctb_send_g2h(AlchemistState *s, uint32_t fence,
+                                    uint32_t hxg_response_word)
+{
+    uint32_t msg[2];
+
     msg[0] = (fence << CTB_MSG_0_FENCE_SHIFT) |
              (CTB_FORMAT_HXG << CTB_MSG_0_FORMAT_SHIFT) |
              (1u & CTB_MSG_0_NUM_DWORDS_MASK);
     msg[1] = hxg_response_word;
 
-    ctb_ring_write_dwords(s, s->g2h.ring_addr, s->g2h.ring_size_dwords,
-                           tail, msg, 2);
+    ctb_g2h_send(s, msg, 2);
+}
 
-    new_tail = (tail + 2) % s->g2h.ring_size_dwords;
-    ctb_desc_write32(s, s->g2h.desc_addr, CTB_DESC_OFF_TAIL, new_tail);
+/*
+ * XE_GUC_ACTION_SCHED_CONTEXT_MODE_DONE - an unsolicited G2H HXG_TYPE_EVENT,
+ * not a reply to any specific request. xe_guc_ct.c's parse_g2h_event()
+ * confirms the fence field is unchecked for EVENT-type messages (only
+ * used for ring-credit accounting), so 0 is fine there.
+ */
+void alchemist_ctb_send_sched_context_mode_done(AlchemistState *s,
+                                                 uint32_t guc_id,
+                                                 uint32_t runnable_state)
+{
+    uint32_t msg[4];
+    uint32_t hxg_hdr = (HXG_ORIGIN_GUC << HXG_MSG_0_ORIGIN_SHIFT) |
+                        (HXG_TYPE_EVENT << HXG_MSG_0_TYPE_SHIFT) |
+                        (XE_GUC_ACTION_SCHED_CONTEXT_MODE_DONE &
+                         HXG_REQUEST_MSG_0_ACTION_MASK);
 
-    alchemist_irq_raise_guc2host(s);
+    msg[0] = (0u << CTB_MSG_0_FENCE_SHIFT) |
+             (CTB_FORMAT_HXG << CTB_MSG_0_FORMAT_SHIFT) |
+             (3u & CTB_MSG_0_NUM_DWORDS_MASK);
+    msg[1] = hxg_hdr;
+    msg[2] = guc_id;
+    msg[3] = runnable_state;
+
+    ctb_g2h_send(s, msg, 4);
 }
 
 void alchemist_ctb_check_h2g(AlchemistState *s)
@@ -140,7 +178,9 @@ void alchemist_ctb_check_h2g(AlchemistState *s)
 
     while (head != tail) {
         uint32_t ctb_hdr = 0, hxg_hdr = 0;
-        uint32_t num_dwords, fence, full_len;
+        uint32_t num_dwords, fence, full_len, msg_start;
+
+        msg_start = head;
 
         if (!ctb_ring_read_dwords(s, s->h2g.ring_addr, s->h2g.ring_size_dwords,
                                    head, &ctb_hdr, 1)) {
@@ -153,7 +193,7 @@ void alchemist_ctb_check_h2g(AlchemistState *s)
 
         if (num_dwords >= 1) {
             ctb_ring_read_dwords(s, s->h2g.ring_addr, s->h2g.ring_size_dwords,
-                                  (head + 1) % s->h2g.ring_size_dwords,
+                                  (msg_start + 1) % s->h2g.ring_size_dwords,
                                   &hxg_hdr, 1);
         }
 
@@ -168,6 +208,23 @@ void alchemist_ctb_check_h2g(AlchemistState *s)
                                  (HXG_TYPE_RESPONSE_SUCCESS << HXG_MSG_0_TYPE_SHIFT);
 
                 alchemist_ctb_send_g2h(s, fence, resp);
+            } else if (type == HXG_TYPE_FAST_REQUEST || type == HXG_TYPE_EVENT) {
+                uint32_t action = hxg_hdr & HXG_REQUEST_MSG_0_ACTION_MASK;
+                uint32_t payload[16];
+                uint32_t n = num_dwords - 1; /* dwords after the hxg header */
+
+                if (n > ARRAY_SIZE(payload)) {
+                    n = ARRAY_SIZE(payload);
+                }
+                if (n > 0 &&
+                    ctb_ring_read_dwords(s, s->h2g.ring_addr,
+                                          s->h2g.ring_size_dwords,
+                                          (msg_start + 2) % s->h2g.ring_size_dwords,
+                                          payload, n)) {
+                    alchemist_submit_handle_action(s, action, payload, n);
+                } else if (n == 0) {
+                    alchemist_submit_handle_action(s, action, NULL, 0);
+                }
             }
         }
 

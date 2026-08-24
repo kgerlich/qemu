@@ -15,9 +15,10 @@
  *           on real hardware so one status register can serve many
  *           possible sources without a dedicated register per source.
  *
- * We only ever raise one source - GuC2Host on bank 0 - since we have no
- * engines/submission implemented yet to raise anything else, but the
- * mechanism is implemented for real: the driver walks this exact cascade
+ * We only ever raise two sources, both bank 0 - GuC2Host and RCS0 (render
+ * engine completion, from alchemist_submit.c) - since no other engines
+ * are modeled yet, but the mechanism is implemented for real: the driver
+ * walks this exact cascade
  * regardless of how many sources exist behind it, so a shortcut here
  * (e.g. firing the MSI without the identity chain backing it) would
  * leave the driver's own gt_engine_identity() spinning until its ~100us
@@ -49,12 +50,16 @@ bool alchemist_irq_is_status_reg(hwaddr addr)
            addr == ALCHEMIST_REG_GT_INTR_DW(1);
 }
 
-void alchemist_irq_raise_guc2host(AlchemistState *s)
+/* Common to every bank-0 source (GuC2Host, RCS0, ...): set the source's
+ * own status bit, then the two cascade levels above it, then fire the
+ * actual MSI - see the file comment for why each level is real, not a
+ * shortcut. */
+static void alchemist_irq_raise_gt0(AlchemistState *s, uint32_t bit)
 {
     uint32_t v;
 
     v = alchemist_mmio_load32(s, ALCHEMIST_REG_GT_INTR_DW(0));
-    alchemist_mmio_store32(s, ALCHEMIST_REG_GT_INTR_DW(0), v | INTR_GUC);
+    alchemist_mmio_store32(s, ALCHEMIST_REG_GT_INTR_DW(0), v | bit);
 
     v = alchemist_mmio_load32(s, ALCHEMIST_REG_GFX_MSTR_IRQ);
     alchemist_mmio_store32(s, ALCHEMIST_REG_GFX_MSTR_IRQ,
@@ -65,6 +70,16 @@ void alchemist_irq_raise_guc2host(AlchemistState *s)
                             v | DG1_MSTR_IRQ | DG1_MSTR_TILE0);
 
     msi_notify(&s->pdev, 0);
+}
+
+void alchemist_irq_raise_guc2host(AlchemistState *s)
+{
+    alchemist_irq_raise_gt0(s, INTR_GUC);
+}
+
+void alchemist_irq_raise_rcs0(AlchemistState *s)
+{
+    alchemist_irq_raise_gt0(s, INTR_RCS0);
 }
 
 /* GT_INTR_DW/GFX_MSTR_IRQ/DG1_MSTR_TILE_INTR: write-1-to-clear status
@@ -100,6 +115,13 @@ void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size)
                            (XE_ENGINE_CLASS_OTHER << INTR_ENGINE_CLASS_SHIFT) |
                            (OTHER_GUC_INSTANCE << INTR_ENGINE_INSTANCE_SHIFT) |
                            GUC_INTR_GUC2HOST;
+                alchemist_mmio_store32(s, ALCHEMIST_REG_INTR_IDENTITY_REG(bank),
+                                        identity);
+            } else if (bank == 0 && selector == INTR_RCS0) {
+                identity = INTR_DATA_VALID |
+                           (XE_ENGINE_CLASS_RENDER << INTR_ENGINE_CLASS_SHIFT) |
+                           (0 << INTR_ENGINE_INSTANCE_SHIFT) |
+                           GT_MI_USER_INTERRUPT;
                 alchemist_mmio_store32(s, ALCHEMIST_REG_INTR_IDENTITY_REG(bank),
                                         identity);
             }

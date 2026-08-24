@@ -747,3 +747,87 @@ Both teardown paths verified independently:
 
 In both cases confirmed via `ps -ef` showing zero matching processes
 immediately after.
+
+## Phase 8: protocol-level command submission (rcs0 workaround job)
+
+Extends `alchemist_ctb_check_h2g()` to act on `HXG_TYPE_FAST_REQUEST`/
+`HXG_TYPE_EVENT` message *content* (previously correctly received but
+never acted on), specifically `GUC_ACTION_REGISTER_CONTEXT` (records a
+`guc_id`'s LRC GGTT address) and `XE_GUC_ACTION_SCHED_CONTEXT[_MODE_SET]`
+(the real "run this context's ring" trigger). New
+`hw/display/alchemist/alchemist_submit.c`.
+
+Rather than a general MI-instruction command-streamer, this recognizes
+only the fixed 9-dword completion epilogue every render/compute-class job
+ends with (`xe_ring_ops.c`'s `emit_job_gen12_render_compute()`: a
+`PIPE_CONTROL` QW breadcrumb write, then `MI_USER_INTERRUPT`), writes the
+real seqno to the real GGTT address it specifies, and raises the
+interrupt cascade's `INTR_RCS0` identity (`alchemist_irq.c`, extended
+from a single-source to a shared bank-0 raise helper). The batch content
+before that epilogue (the actual workaround register writes) is
+deliberately not interpreted - `xe_hw_fence_signaled()` only ever polls
+the seqno memory location, so real hardware's own completion path
+doesn't depend on that content being simulated either.
+
+### A real bug found and fixed by testing, not guessed at
+
+Initial implementation read `CTX_RING_TAIL` and walked backward exactly
+9 dwords, assuming zero padding. Live testing showed the real epilogue
+consistently starting one dword *later* than expected - `RING_TAIL` is
+QWORD (8-byte) aligned, but the epilogue is 9 dwords (36 bytes, not a
+multiple of 8), so `xe_lrc_write_ring()` inserts a single `MI_NOOP` (value
+`0`) pad dword to reach that alignment. Fixed by searching backward from
+tail for the epilogue's actual last instruction (`MI_ARB_CHECK`, a fixed,
+recognizable value) across a small bounded tolerance, rather than
+assuming a fixed offset. Real trace confirming this, captured before the
+fix (temporary tracing, removed before commit):
+```
+run_context guc_id=1 ring_addr=0x670000 tail_off=0xb0 ring_size=0x4000
+epilogue=[01104080 00674200 00000000 ffffff81 00000000 01000000 04000001 02800000 00000000]
+want=[7a000004 01104080 .. 01000000]
+```
+(`epilogue[3]=0xffffff81` is `XE_FENCE_INITIAL_SEQNO` as a `u32` - real,
+expected data, confirming the read itself was correct and only the
+window's starting offset was off by one dword.)
+
+Also found and fixed: `CTX_RING_START` is a 32-bit register, but the
+first implementation read it directly into a `uint64_t` via a 4-byte
+`alchemist_ggtt_read()` - the upper 32 bits were left as uninitialized
+stack garbage, which would have made the ring address essentially random
+whenever the compiler happened to leave nonzero bits there. Fixed by
+reading into a `uint32_t` and assigning (zero-extending) into the 64-bit
+address used for GGTT calls.
+
+### Evidence
+
+The originally-targeted stall is gone - `hwe rcs0`'s workaround job (the
+exact one this project's earlier evidence showed timing out with `-ETIME`,
+`guc_id=1`) now completes, and probe advances substantially further,
+setting up further GuC-scheduled contexts:
+```
+REGISTER_CONTEXT guc_id=1 hwlrca=0x674019 lrc_ggtt_addr=0x674000
+SCHED_CONTEXT_MODE_SET guc_id=1 enable=1   -> rcs0 job completes, no -ETIME
+REGISTER_CONTEXT guc_id=2 ...
+REGISTER_CONTEXT guc_id=3 hwlrca=0x6b4019 lrc_ggtt_addr=0x6b4000
+SCHED_CONTEXT_MODE_SET guc_id=3 enable=1
+[   16.568477] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: hwe bcs0: emit_wa_job failed (-ETIME) guc_id=3
+[   16.568595] xe 0000:00:04.0: probe with driver xe failed with error -62
+```
+Probe now fails on a **different, structurally distinct** engine class -
+`bcs0` (the blitter/copy engine), `guc_id=3` - not another rcs0 problem.
+Confirmed directly from source
+(`drivers/gpu/drm/xe/xe_ring_ops.c`): `XE_ENGINE_CLASS_COPY` uses
+`ring_ops_gen12_copy` -> `emit_job_gen12_copy()` ->
+`__emit_job_gen12_simple()`, a genuinely different (and simpler)
+completion sequence with **no `PIPE_CONTROL` at all** - a plain
+`MI_STORE_DATA_IMM` breadcrumb instead. This is real, new, additional
+scope (recognizing a second, different fixed epilogue and a second
+interrupt identity/engine class), not a bug in the rcs0 fix - reproduced
+identically across a clean rebuild with all temporary tracing removed.
+
+Reproduced cleanly with the temporary tracing removed, confirming this
+milestone doesn't depend on it:
+```
+[   16.568477] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: hwe bcs0: emit_wa_job failed (-ETIME) guc_id=3
+```
+(same stall, same guc_id, across two independent boots - not a fluke.)

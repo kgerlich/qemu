@@ -50,6 +50,21 @@ typedef struct AlchemistGucProc {
     char *qmp_path;
 } AlchemistGucProc;
 
+/*
+ * Per-context state registered via GUC_ACTION_REGISTER_CONTEXT (see
+ * alchemist_submit.c) - just enough to find a guc_id's LRC when a later
+ * SCHED_CONTEXT/SCHED_CONTEXT_MODE_SET message arrives. Sized for early
+ * command-submission bring-up (real guc_id space is larger); an
+ * out-of-range guc_id is bounds-checked and ignored, not undefined
+ * behavior.
+ */
+#define ALCHEMIST_MAX_CONTEXTS 64
+
+typedef struct AlchemistContext {
+    bool registered;
+    uint64_t lrc_ggtt_addr; /* PPHWSP GGTT address - xe_lrc_ggtt_addr() */
+} AlchemistContext;
+
 typedef struct AlchemistState {
     PCIDevice pdev;
     MemoryRegion mmio;
@@ -59,6 +74,7 @@ typedef struct AlchemistState {
     AlchemistCtb h2g;
     AlchemistCtb g2h;
     AlchemistGucProc guc_proc;
+    AlchemistContext ctx[ALCHEMIST_MAX_CONTEXTS];
 } AlchemistState;
 
 static inline uint32_t alchemist_mmio_load32(AlchemistState *s, hwaddr addr)
@@ -122,6 +138,7 @@ bool alchemist_ggtt_write(AlchemistState *s, uint64_t ggtt_addr,
 bool alchemist_irq_is_status_reg(hwaddr addr);
 void alchemist_irq_status_write(AlchemistState *s, hwaddr addr, uint64_t val);
 void alchemist_irq_raise_guc2host(AlchemistState *s);
+void alchemist_irq_raise_rcs0(AlchemistState *s);
 void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
 
 /*
@@ -132,6 +149,20 @@ void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
  */
 void alchemist_ctb_register(AlchemistState *s, uint16_t key, uint64_t val);
 void alchemist_ctb_check_h2g(AlchemistState *s);
+void alchemist_ctb_send_sched_context_mode_done(AlchemistState *s,
+                                                 uint32_t guc_id,
+                                                 uint32_t runnable_state);
+
+/*
+ * Command submission - see alchemist_submit.c. Called from
+ * alchemist_ctb_check_h2g() for HXG_TYPE_FAST_REQUEST/EVENT messages
+ * (GUC_ACTION_REGISTER_CONTEXT, XE_GUC_ACTION_SCHED_CONTEXT[_MODE_SET]) -
+ * these never get a synchronous CTB reply (see alchemist_ctb.c's file
+ * comment), so this only ever has side effects, never a return value to
+ * send back on this same call.
+ */
+void alchemist_submit_handle_action(AlchemistState *s, uint32_t action,
+                                     const uint32_t *payload, uint32_t n);
 
 /*
  * Satellite GuC coprocessor process - see alchemist_guc_proc.c. Launches a
