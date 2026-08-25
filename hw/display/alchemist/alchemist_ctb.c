@@ -172,6 +172,32 @@ void alchemist_ctb_send_sched_context_mode_done(AlchemistState *s,
     ctb_g2h_send(s, msg, 4);
 }
 
+/*
+ * XE_GUC_ACTION_TLB_INVALIDATION_DONE - an unsolicited G2H HXG_TYPE_EVENT
+ * carrying the completed seqno, same real shape as
+ * SCHED_CONTEXT_MODE_DONE above but with a 1-dword payload
+ * (xe_guc_tlb_inval_done_handler() requires len == 1) - see
+ * alchemist_regs.h's file comment for why immediate acknowledgment is
+ * the real, correct completion here, not a shortcut.
+ */
+void alchemist_ctb_send_tlb_invalidation_done(AlchemistState *s,
+                                               uint32_t seqno)
+{
+    uint32_t msg[3];
+    uint32_t hxg_hdr = (HXG_ORIGIN_GUC << HXG_MSG_0_ORIGIN_SHIFT) |
+                        (HXG_TYPE_EVENT << HXG_MSG_0_TYPE_SHIFT) |
+                        (XE_GUC_ACTION_TLB_INVALIDATION_DONE &
+                         HXG_REQUEST_MSG_0_ACTION_MASK);
+
+    msg[0] = (0u << CTB_MSG_0_FENCE_SHIFT) |
+             (CTB_FORMAT_HXG << CTB_MSG_0_FORMAT_SHIFT) |
+             (2u & CTB_MSG_0_NUM_DWORDS_MASK);
+    msg[1] = hxg_hdr;
+    msg[2] = seqno;
+
+    ctb_g2h_send(s, msg, 3);
+}
+
 void alchemist_ctb_check_h2g(AlchemistState *s)
 {
     uint32_t head, tail;
@@ -237,6 +263,12 @@ void alchemist_ctb_check_h2g(AlchemistState *s)
              */
             if (have_payload && action == GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST) {
                 alchemist_pc_handle_slpc_request(s, payload, n);
+            }
+
+            if (have_payload && n >= 1 &&
+                (action == XE_GUC_ACTION_TLB_INVALIDATION ||
+                 action == XE_GUC_ACTION_TLB_INVALIDATION_ALL)) {
+                alchemist_ctb_send_tlb_invalidation_done(s, payload[0]);
             }
 
             if (type == HXG_TYPE_REQUEST) {

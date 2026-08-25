@@ -28,6 +28,14 @@
  * reads it to distinguish production from pre-production silicon;
  * leaving it clear makes the driver log an error and taint the kernel.
  *
+ * Also populates the GT topology fuse registers (DSS/EU enable masks -
+ * see alchemist_regs.h) with a minimal real DSS 0 present in both the
+ * geometry and compute masks and a full EU-enable mask, keeping CCS0
+ * from being fused off by xe_hw_engine.c's read_compute_fuses_from_dss()
+ * - confirmed necessary directly against a real `intel-opencl-icd`
+ * abort in compute-runtime's engine enumeration (Phase 13 follow-up,
+ * see docs/alchemist-bringup.md).
+ *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
@@ -47,4 +55,8 @@ void alchemist_vram_init(AlchemistState *s)
     alchemist_mmio_store32(s, ALCHEMIST_REG_SG_TILE_ADDR_RANGE(0), tile_addr_range);
     alchemist_mmio_store32(s, ALCHEMIST_REG_XEHP_FLAT_CCS_BASE_ADDR, flat_ccs_base_addr);
     alchemist_mmio_store32(s, ALCHEMIST_REG_FUSE2, PRODUCTION_HW);
+
+    alchemist_mmio_store32(s, ALCHEMIST_REG_XELP_GT_GEOMETRY_DSS_ENABLE, 0xFFu);
+    alchemist_mmio_store32(s, ALCHEMIST_REG_XEHP_GT_COMPUTE_DSS_ENABLE, 0xFFu);
+    alchemist_mmio_store32(s, ALCHEMIST_REG_XELP_EU_ENABLE, XELP_EU_MASK);
 }

@@ -179,6 +179,8 @@ void alchemist_ctb_check_h2g(AlchemistState *s);
 void alchemist_ctb_send_sched_context_mode_done(AlchemistState *s,
                                                  uint32_t guc_id,
                                                  uint32_t runnable_state);
+void alchemist_ctb_send_tlb_invalidation_done(AlchemistState *s,
+                                               uint32_t seqno);
 
 /*
  * Command submission - see alchemist_submit.c. Called from

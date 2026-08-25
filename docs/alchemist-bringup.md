@@ -1304,3 +1304,139 @@ probe unaffected. The pre-existing `xe_display_pm_shutdown` NULL-deref
 on poweroff (documented above, Phase 9-era finding - display isn't
 implemented until Phase 15) still occurs, unrelated to this phase's
 changes and after all evidence had already been captured.
+
+## Phase 13 follow-up: real guest-side OpenCL bring-up
+
+Booting the real guest and running a real OpenCL kernel against the
+device (`intel-opencl-icd` + `clinfo`, installed into the guest rootfs
+from Ubuntu's real archive - `apt-cache policy` confirms both are
+`universe` packages, no external repo needed) surfaced four more real,
+previously-unexercised gaps - none hit by the Phase 13 self-test, since
+that called `alchemist_gpgpu_process_ring()` directly rather than going
+through a real compute-runtime device probe. Each was root-caused with
+real evidence (kernel dmesg, a real `intel-opencl-icd` crash resolved to
+an exact source line via Ubuntu's `ddebs.ubuntu.com` debug-symbol
+archive matched to the exact installed package version, and direct
+kernel/compute-runtime source reads) before being fixed - no guessing.
+
+**1. GT topology fuse registers were never modeled at all.** Left at
+their generic-buffer default of 0 (no DSS/EU anywhere), `xe_hw_engine.c`'s
+`read_compute_fuses_from_dss()` correctly (from its own point of view)
+fused off every CCS engine, and compute-runtime's own engine enumeration
+(`IoctlHelperXe::createEngineInfo()`) found zero compute-class engines
+and aborted (`UNRECOVERABLE_IF(!defaultEngine)`) - confirmed against a
+real `intel-opencl-icd` abort message. Fixed by populating
+`XELP_GT_GEOMETRY_DSS_ENABLE`/`XEHP_GT_COMPUTE_DSS_ENABLE`/
+`XELP_EU_ENABLE` at `alchemist_vram_init()` time (8 active DSS, full
+EU-enable mask) - real, minimal, valid values, not a full real-chip
+fusing table, but enough for `xe_gt_topology_has_dss_in_quadrant()` to
+keep CCS0 alive.
+
+**2. `XE_ENGINE_CLASS_COMPUTE`'s value was simply wrong.** Defined as
+`5u` (matching xe's *internal* `enum xe_engine_class`,
+`xe_hw_engine_types.h`), but the real `REGISTER_CONTEXT` payload's
+`engine_class` field actually carries a *different* enum entirely -
+GuC's own class numbering (`abi/guc_scheduler_abi.h`:
+`GUC_RENDER_CLASS=0, GUC_VIDEO_CLASS=1, GUC_VIDEOENHANCE_CLASS=2,
+GUC_BLITTER_CLASS=3, GUC_COMPUTE_CLASS=4`), translated by
+`xe_engine_class_to_guc_class()` before transmission. RENDER (0) and
+COPY/BLITTER (3) happen to coincide numerically between the two
+enumerations - pure coincidence that masked this since Phase 8 - but
+COMPUTE does not (5 vs 4). A live trace of a real `hwe ccs0` workaround
+job's `REGISTER_CONTEXT` showed `engine_class=4` arriving at
+`alchemist_submit.c`'s `switch`, silently falling to `default: return`
+(correctly-by-design for an *actually* unrecognized class, but wrong
+here since 4 *is* GuC's real compute class) and timing out
+(`emit_wa_job failed (-ETIME)`). Fixed by correcting the constant to
+`4u`, with the real distinction documented in `alchemist_regs.h` so it
+isn't "fixed" back by someone consulting the (correct, but wrong-context)
+kernel-internal enum later.
+
+**3. The GuC hwconfig table was a deliberate, but now-blocking,
+placeholder.** `alchemist_guc.c` already answered `XE_GUC_ACTION_GET_HWCONFIG`'s
+size-query with a nonzero placeholder (so `xe_guc_hwconfig_init()`
+wouldn't hard-fail), but left the actual table content as freshly-
+allocated zeroed memory - a deliberate Phase-8-era decision to avoid
+fabricating GPU capability data with no real values to report. With a
+real compute-capable device now being queried this deeply,
+compute-runtime's `NEO::SystemInfo::parseDeviceBlob()` parsed the
+all-zero blob into all-zero slice/subslice/EU counts, and a later,
+unconditional division inside `IoctlHelperXe::getTopologyDataAndMap()`
+(`MaxSubSlicesSupported / MaxSlicesSupported`, no zero-check) turned that
+into a real `SIGFPE` - root-caused precisely by downloading the matching
+`intel-opencl-icd-dbgsym` package from Ubuntu's ddebs archive (build-ID
+matched exactly) and resolving the crash address with `addr2line`, not
+by guessing. Fixed by delivering a real, minimal hwconfig KLV table
+(`[key, len, value]` triplets, `NEO::DeviceBlobConstants`'s real key IDs:
+`maxSlicesSupported=1`, `maxDualSubSlicesSupported=2`,
+`maxEuPerDualSubSlice=3`, `numThreadsPerEu=15`) reporting the *exact
+same* topology already established via the GT fuse registers above (8
+DSS, 16 EU/DSS, 8 threads/EU) through this second real protocol path -
+not inventing a second, independent configuration, just reporting the
+one we already have through the mechanism real hardware actually uses
+for it.
+
+**4. TLB invalidation was unimplemented and real buffer binds now
+trigger it.** `XE_GUC_ACTION_TLB_INVALIDATION` (`xe_guc_tlb_inval.c`) is
+fire-and-forget over CTB (no synchronous reply - same "no g2h_fence"
+shape as `HOST2GUC_PC_SLPC_REQUEST`); real completion is a *separate*,
+unsolicited G2H event, `XE_GUC_ACTION_TLB_INVALIDATION_DONE`, carrying
+the same seqno the request did. Left unanswered, a real
+`clCreateBuffer()`/`VM_BIND` stalls waiting for it
+(`*ERROR* TLB invalidation fence timeout, seqno=N recv=0`, repeating).
+Fixed with `alchemist_ctb_send_tlb_invalidation_done()`
+(`alchemist_ctb.c`) - and since this project never actually caches a
+translation (every PPGTT/GGTT access walks real, current guest memory
+fresh), immediate acknowledgment *is* the real, correct completion, not
+a shortcut around one.
+
+### Evidence
+
+With all four fixes applied, a real guest boot with `intel-opencl-icd`/
+`clinfo` installed (Ubuntu archive packages, `apt-get install
+intel-opencl-icd clinfo ocl-icd-libopencl1`) shows:
+```
+Platform #0: Intel(R) OpenCL Graphics
+ `-- Device #0: Intel(R) Arc(TM) A380 Graphics
+```
+and a real C test program (`clGetPlatformIDs`/`clGetDeviceIDs`/
+`clCreateContext`/`clCreateCommandQueueWithProperties`/
+`clCreateProgramWithSource`/`clBuildProgram`) against it:
+```
+CL-TEST: platforms found = 1
+CL-TEST: platform[0] name = Intel(R) OpenCL Graphics
+CL-TEST: GPU devices found = 1
+CL-TEST: device[0] name = Intel(R) Arc(TM) A380 Graphics
+CL-TEST: kernel built OK (real IGC online compile)
+```
+The last line is real, independent confirmation of Phase 13's own DG2
+target: `clBuildProgram()` compiling `kernel void store(global int *buf)
+{ buf[0] = 42; }` from source invokes the *real* IGC online compiler
+(`libigc2`/`libigdfcl2`, the same compiler `ocloc` used to produce the
+research bytes cited earlier in this phase) targeting our simulated
+device's reported platform/device info end to end - not a prebuilt
+binary, a fresh compile against everything this device model reports
+about itself.
+
+### Known remaining gap: a kernel-submitted "pulse"/heartbeat job stalls dispatch
+
+`clEnqueueNDRangeKernel()`/`clFinish()` on the real kernel above does not
+yet complete - the guest kernel driver repeatedly logs a *different*,
+kernel-internal submission stalling and resetting in a loop:
+```
+xe 0000:00:04.0: [drm] Tile0: GT0: Timedout job: seqno=4294967169, lrc_seqno=4294967169, guc_id=0, flags=0x43 in no process [-1]
+xe 0000:00:04.0: [drm] Tile0: GT0: Kernel-submitted job timed out
+xe 0000:00:04.0: [drm] Tile0: GT0: trying reset from guc_exec_queue_timedout_job [xe]
+xe 0000:00:04.0: [drm] Tile0: GT0: reset done
+```
+`in no process [-1]` and the seqno values themselves (`4294967169` =
+`0xFFFFFFC1`, and later attempts at `0xFFFFFFD2`/`0xFFFFFFD3` - all near
+`UINT32_MAX`, not small sequential job numbers) point at a
+kernel-internal keepalive/health-check mechanism distinct from both the
+Phase 8 workaround-job path and Phase 13's `COMPUTE_WALKER` dispatch
+path - not yet root-caused. This is flagged honestly as the next
+concrete blocker, not guessed at or worked around: real evidence (which
+exact "pulse"/heartbeat submission this is, what ring content it uses,
+why our existing epilogue-completion mechanism doesn't already handle
+it) is needed before implementing a fix, the same discipline used for
+every gap above. No code changes were made for this gap in this session.

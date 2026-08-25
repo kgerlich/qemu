@@ -33,19 +33,25 @@
  *    write at all "rings the doorbell" - it's not a bit-flag register),
  *    then polling VF_SW_FLAG(0) for a GuC-origin response. We implement
  *    the protocol itself faithfully (real HXG header encoding, real
- *    response handshake), but for XE_GUC_ACTION_GET_HWCONFIG specifically
- *    we only answer the size-query correctly (a nonzero placeholder size -
- *    xe_guc_hwconfig_init() hard-fails on a zero size) and otherwise
- *    just acknowledge success. We deliberately don't deliver real
- *    hwconfig table *content* on the follow-up copy request even though
- *    we now have GGTT translation and could write bytes there: real
- *    hwconfig content encodes real GPU capabilities (EU counts, cache
- *    sizes, ...) we have no authentic values for, and fabricating a
- *    plausible-looking entry would be exactly the kind of invented data
- *    to avoid. The guest's hwconfig buffer is left as freshly-allocated
- *    zeroed memory, which xe_guc_hwconfig_lookup_u32()'s parser handles
- *    safely (reads as "zero attributes", not a crash). Flagged here and
- *    in docs/alchemist-bringup.md as a known, deliberate deferral.
+ *    response handshake). XE_GUC_ACTION_GET_HWCONFIG (xe_guc_hwconfig.c
+ *    send_get_hwconfig()/guc_hwconfig_size()/guc_hwconfig_copy()) is a
+ *    two-call sequence: a size query (ggtt_addr=0, size=0 - answer with
+ *    the real table's byte size, xe_guc_hwconfig_init() hard-fails on a
+ *    zero size) followed by a copy request (a real GGTT address, the
+ *    same size) that we now actually deliver alchemist_hwconfig_table's
+ *    real bytes into via alchemist_ggtt_write() - Phase 13 follow-up:
+ *    compute-runtime parses this table itself (NEO's SystemInfo,
+ *    shared/source/os_interface/linux/system_info.cpp) to populate
+ *    slice/subslice/EU-per-subslice/threads-per-EU counts, and an empty
+ *    table left every one of those at its zero default, which a later,
+ *    unrelated unconditional division inside compute-runtime's own
+ *    topology processing (IoctlHelperXe::getTopologyDataAndMap()) turns
+ *    into a real SIGFPE the moment a real compute-capable device is
+ *    queried this deeply - confirmed directly against a crashing
+ *    `intel-opencl-icd`, see docs/alchemist-bringup.md. The table
+ *    reported here isn't invented data - see alchemist_regs.h's comment
+ *    for why it's the exact same topology already established via the
+ *    GT fuse registers, reported through this second real protocol path.
  *
  *    GUC_ACTION_HOST2GUC_SELF_CFG additionally gets its key/value decoded
  *    and handed to alchemist_ctb_register() (alchemist_ctb.c) - this is
@@ -68,6 +74,15 @@
 #include "qemu/osdep.h"
 #include "alchemist_internal.h"
 #include "alchemist_regs.h"
+
+/* [key, len_dw, value] triplets - see alchemist_regs.h's HWCONFIG_KEY_*
+ * comment for what these values mean and where they come from. */
+static const uint32_t alchemist_hwconfig_table[] = {
+    HWCONFIG_KEY_MAX_SLICES_SUPPORTED,        1, 1,
+    HWCONFIG_KEY_MAX_DUAL_SUBSLICES_SUPPORTED, 1, 8,
+    HWCONFIG_KEY_MAX_EU_PER_DUAL_SUBSLICE,     1, 16,
+    HWCONFIG_KEY_NUM_THREADS_PER_EU,           1, 8,
+};
 
 void alchemist_guc_mmio_write(AlchemistState *s, hwaddr addr, unsigned size)
 {
@@ -128,12 +143,21 @@ void alchemist_guc_mmio_write(AlchemistState *s, hwaddr addr, unsigned size)
                 uint32_t ggtt_lo = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(1));
                 uint32_t ggtt_hi = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(2));
                 uint32_t req_size = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(3));
+                uint32_t table_bytes = sizeof(alchemist_hwconfig_table);
 
                 if (ggtt_lo == 0 && ggtt_hi == 0 && req_size == 0) {
-                    /* Size query: must be nonzero or xe_guc_hwconfig_init()
-                     * treats it as failure. See the file comment above for
-                     * why we don't deliver real table content. */
-                    data0 = 12;
+                    /* Size query - xe_guc_hwconfig_init() hard-fails on a
+                     * zero size, and allocates exactly this many bytes
+                     * for the follow-up copy request below. */
+                    data0 = table_bytes;
+                } else {
+                    /* Copy request: deliver the real table, bounded by
+                     * whatever the guest actually allocated. */
+                    uint64_t ggtt_addr = ((uint64_t)ggtt_hi << 32) | ggtt_lo;
+                    uint32_t len = MIN(req_size, table_bytes);
+
+                    alchemist_ggtt_write(s, ggtt_addr, alchemist_hwconfig_table, len);
+                    data0 = len;
                 }
             } else if (action == GUC_ACTION_HOST2GUC_SELF_CFG) {
                 uint32_t word1 = alchemist_mmio_load32(s, ALCHEMIST_REG_VF_SW_FLAG(1));

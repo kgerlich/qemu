@@ -74,6 +74,26 @@
 #define   PRODUCTION_HW                (1u << 2)
 
 /*
+ * GT topology fuse registers - regs/xe_gt_regs.h, read by
+ * xe_gt_topology_init() (xe_gt_topology.c) to build the DSS (dual
+ * subslice)/EU masks compute-runtime later queries via
+ * DRM_XE_DEVICE_QUERY_GT_TOPOLOGY. DG2 (graphics_xehpg descriptor,
+ * xe_pci.c) uses exactly one fuse register for each of geometry/compute
+ * (num_geometry_xecore_fuse_regs = num_compute_xecore_fuse_regs = 1), so
+ * dss_per_quad = 32*1/4 = 8 (xe_gt_topology_has_dss_in_quadrant()) -
+ * reporting DSS 0 present in the compute mask keeps quadrant 0 (and so
+ * CCS0) from being fused off. Leaving these at their generic-buffer
+ * default of 0 (no DSS/EU anywhere) is what caused compute-runtime's
+ * IoctlHelperXe::createEngineInfo() to find zero compute-class engines
+ * and UNRECOVERABLE_IF(!defaultEngine) - confirmed directly against a
+ * real `intel-opencl-icd` abort, see docs/alchemist-bringup.md.
+ */
+#define ALCHEMIST_REG_XELP_EU_ENABLE               0x9134
+#define   XELP_EU_MASK                             0xFFu   /* bits [7:0] */
+#define ALCHEMIST_REG_XELP_GT_GEOMETRY_DSS_ENABLE  0x913c
+#define ALCHEMIST_REG_XEHP_GT_COMPUTE_DSS_ENABLE   0x9144
+
+/*
  * GuC firmware load - drivers/gpu/drm/xe/regs/xe_guc_regs.h and
  * xe_wopcm.c/xe_uc_fw.c/xe_guc.c. See alchemist_guc.c for the handshake
  * this implements.
@@ -131,6 +151,33 @@
 
 /* XE_GUC_ACTION_GET_HWCONFIG - abi/guc_actions_abi.h */
 #define GUC_ACTION_GET_HWCONFIG             0x4100u
+
+/*
+ * GuC hwconfig table content - a flat sequence of [key, len_dw, value...]
+ * KLV entries (NEO's shared/source/os_interface/linux/system_info.cpp
+ * DeviceBlobConstants - the real userspace-side parser for this exact
+ * table, confirmed by decoding a real compute-runtime SIGFPE: with no
+ * real entries (the deliberate deferral this used to be - see
+ * alchemist_guc.c's file comment), NEO::SystemInfo::parseDeviceBlob()
+ * leaves maxSlicesSupported at its default-constructed 0, and
+ * IoctlHelperXe::getTopologyDataAndMap() unconditionally divides by it
+ * (MaxSubSlicesSupported / MaxSlicesSupported) with no zero-check - a
+ * real NEO bug that only surfaces once a real compute-capable device
+ * (CCS0 not fused off) is actually queried this deeply, which nothing
+ * before Phase 13 ever exercised.
+ *
+ * Values reported here are not invented - they're the exact same
+ * topology already established via the GT fuse registers above
+ * (alchemist_vram_init(): 8 active DSS, EU_ENABLE=0xFF -> 16 EU/DSS per
+ * xe_hw_engine.c's SIMD8-doubling, DG2::setupHardwareInfoBase()'s own
+ * hardcoded NumThreadsPerEu=8u), reported through this second real
+ * protocol path GuC hwconfig represents - the same real configuration,
+ * not a second, independently-fabricated one.
+ */
+#define HWCONFIG_KEY_MAX_SLICES_SUPPORTED       1u
+#define HWCONFIG_KEY_MAX_DUAL_SUBSLICES_SUPPORTED 2u
+#define HWCONFIG_KEY_MAX_EU_PER_DUAL_SUBSLICE   3u
+#define HWCONFIG_KEY_NUM_THREADS_PER_EU         15u
 /* GUC_ACTION_HOST2GUC_SELF_CFG - abi/guc_actions_abi.h. guc_self_cfg()
  * (xe_guc.c) treats a response data0 of exactly 1 as success (the count
  * of KLV entries configured) and 0 specifically as -ENOKEY. */
@@ -230,7 +277,19 @@
  * emit_job_gen12_render_compute()) - only the interrupt identity
  * differs. */
 #define   INTR_CCS0                          (1u << 4)
-#define   XE_ENGINE_CLASS_COMPUTE            5u
+/* NOT xe's internal enum xe_engine_class (xe_hw_engine_types.h), which
+ * has XE_ENGINE_CLASS_COMPUTE = 5 - the REGISTER_CONTEXT payload's
+ * engine_class field actually carries GuC's OWN class enum
+ * (abi/guc_scheduler_abi.h's GUC_RENDER_CLASS=0/GUC_VIDEO_CLASS=1/
+ * GUC_VIDEOENHANCE_CLASS=2/GUC_BLITTER_CLASS=3/GUC_COMPUTE_CLASS=4 -
+ * translated from xe's internal enum by xe_engine_class_to_guc_class(),
+ * xe_guc_ads.c), a DIFFERENT numbering that only happens to coincide
+ * with xe's own for RENDER(0) and COPY/BLITTER(3) - confirmed the hard
+ * way: a real hwe ccs0 workaround job's REGISTER_CONTEXT arrived with
+ * engine_class=4, not 5, causing it to fall through this project's
+ * switch's `default: return` (silently, correctly-by-design ignoring an
+ * unrecognized class) and time out. See docs/alchemist-bringup.md. */
+#define   XE_ENGINE_CLASS_COMPUTE            4u
 
 /*
  * GuC context registration/scheduling actions - abi/guc_actions_abi.h.
@@ -319,6 +378,28 @@
  * then global_state(u32) at byte offset 4. */
 #define SLPC_SHARED_DATA_GLOBAL_STATE_OFF   4u
 #define   SLPC_GLOBAL_STATE_RUNNING         3u
+
+/*
+ * TLB invalidation - abi/guc_actions_abi.h, xe_guc_tlb_inval.c
+ * (send_tlb_inval_ggtt()/send_tlb_inval_ppgtt() etc.). A fire-and-forget
+ * H2G (no synchronous CTB reply - sent via plain xe_guc_ct_send(), not
+ * the _recv() variant that would promote it to HXG_TYPE_REQUEST, same
+ * "no g2h_fence" reasoning as GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST above)
+ * whose real completion is a separate, unsolicited G2H event
+ * (XE_GUC_ACTION_TLB_INVALIDATION_DONE, 1-dword payload: the same seqno
+ * the H2G action carried) - xe_guc_tlb_inval_done_handler() asserts
+ * seqnos arrive in order and wakes any waiters/fences for it. Since this
+ * project never caches a translation (every PPGTT/GGTT read/write walks
+ * real, current guest memory fresh - alchemist_ggtt.c/alchemist_ppgtt.c),
+ * "invalidation" is vacuously already true the instant it's requested;
+ * acknowledging it immediately is the real, correct completion, not a
+ * shortcut - confirmed necessary live (a real compute-runtime buffer
+ * bind stalls waiting for this ack, "TLB invalidation fence timeout"),
+ * see docs/alchemist-bringup.md.
+ */
+#define XE_GUC_ACTION_TLB_INVALIDATION       0x7000u
+#define XE_GUC_ACTION_TLB_INVALIDATION_DONE  0x7001u
+#define XE_GUC_ACTION_TLB_INVALIDATION_ALL   0x7002u
 
 /*
  * PPGTT (per-process page tables) - regs/xe_gtt_defs.h, xe_pt.c, xe_vm.c.
