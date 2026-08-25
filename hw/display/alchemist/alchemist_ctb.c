@@ -26,6 +26,15 @@
  * SCHED_CONTEXT_MODE_DONE) via alchemist_ctb_send_sched_context_mode_done()
  * below - a real, separate wire message, not a reply to this one.
  *
+ * A few actions need a real side effect beyond whatever ack/non-ack
+ * their message type gets - currently just GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST
+ * (see alchemist_pc.c), checked regardless of type: confirmed live that
+ * xe_guc_pc_start()'s RESET event arrives as HXG_TYPE_FAST_REQUEST, not
+ * TYPE_REQUEST as its own ABI doc block's TYPE field suggests in the
+ * abstract - xe_guc_ct.c's h2g_write() only promotes to TYPE_REQUEST
+ * when the caller passes a g2h_fence, and pc_action_reset() (like
+ * submit_exec_queue()'s SCHED_CONTEXT) does not.
+ *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
@@ -202,6 +211,33 @@ void alchemist_ctb_check_h2g(AlchemistState *s)
 
         if (num_dwords >= 1) {
             uint32_t type = (hxg_hdr >> HXG_MSG_0_TYPE_SHIFT) & HXG_TYPE_MASK;
+            uint32_t action = hxg_hdr & HXG_REQUEST_MSG_0_ACTION_MASK;
+            uint32_t payload[16];
+            uint32_t n = num_dwords - 1; /* dwords after the hxg header */
+            bool have_payload;
+
+            if (n > ARRAY_SIZE(payload)) {
+                n = ARRAY_SIZE(payload);
+            }
+            have_payload = n == 0 ||
+                ctb_ring_read_dwords(s, s->h2g.ring_addr,
+                                      s->h2g.ring_size_dwords,
+                                      (msg_start + 2) % s->h2g.ring_size_dwords,
+                                      payload, n);
+
+            /*
+             * GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST's GGTT side effect
+             * (see alchemist_pc.c) applies regardless of message type -
+             * confirmed live that xe_guc_pc_start()'s RESET actually
+             * arrives as HXG_TYPE_FAST_REQUEST, the same as
+             * XE_GUC_ACTION_SCHED_CONTEXT (xe_guc_ct.c's h2g_write()
+             * only promotes to HXG_TYPE_REQUEST when the caller passes a
+             * g2h_fence, which pc_action_reset() - like
+             * submit_exec_queue() - does not).
+             */
+            if (have_payload && action == GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST) {
+                alchemist_pc_handle_slpc_request(s, payload, n);
+            }
 
             if (type == HXG_TYPE_REQUEST) {
                 uint32_t resp = (HXG_ORIGIN_GUC << HXG_MSG_0_ORIGIN_SHIFT) |
@@ -209,21 +245,8 @@ void alchemist_ctb_check_h2g(AlchemistState *s)
 
                 alchemist_ctb_send_g2h(s, fence, resp);
             } else if (type == HXG_TYPE_FAST_REQUEST || type == HXG_TYPE_EVENT) {
-                uint32_t action = hxg_hdr & HXG_REQUEST_MSG_0_ACTION_MASK;
-                uint32_t payload[16];
-                uint32_t n = num_dwords - 1; /* dwords after the hxg header */
-
-                if (n > ARRAY_SIZE(payload)) {
-                    n = ARRAY_SIZE(payload);
-                }
-                if (n > 0 &&
-                    ctb_ring_read_dwords(s, s->h2g.ring_addr,
-                                          s->h2g.ring_size_dwords,
-                                          (msg_start + 2) % s->h2g.ring_size_dwords,
-                                          payload, n)) {
+                if (have_payload) {
                     alchemist_submit_handle_action(s, action, payload, n);
-                } else if (n == 0) {
-                    alchemist_submit_handle_action(s, action, NULL, 0);
                 }
             }
         }

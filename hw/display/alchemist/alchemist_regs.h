@@ -65,6 +65,14 @@
 #define ALCHEMIST_REG_XEHP_FLAT_CCS_BASE_ADDR 0x4910
 #define   XEHP_FLAT_CCS_PTR_SHIFT      8   /* GENMASK(31, 8), in 64K units */
 
+/* FUSE2 - regs/xe_gt_regs.h. xe_device_verify_dontcopy_wa() (xe_device.c)
+ * reads bit PRODUCTION_HW to distinguish production from pre-production
+ * silicon; leaving it unset makes the driver log an error and taint the
+ * kernel, which "clean dmesg" doesn't allow for a device claiming to be
+ * a real, shipped DG2 card. */
+#define ALCHEMIST_REG_FUSE2            0x9120
+#define   PRODUCTION_HW                (1u << 2)
+
 /*
  * GuC firmware load - drivers/gpu/drm/xe/regs/xe_guc_regs.h and
  * xe_wopcm.c/xe_uc_fw.c/xe_guc.c. See alchemist_guc.c for the handshake
@@ -284,5 +292,23 @@
 #define MI_FLUSH_DW_USE_GTT_BIT             0x00000004u
 #define XE_ENGINE_CLASS_COPY                3u
 #define INTR_BCS0                           (1u << 15)
+
+/*
+ * GuC PC (SLPC - Single Loop Power Control), abi/guc_actions_slpc_abi.h.
+ * A CTB HXG_TYPE_REQUEST action (xe_guc_pc.c pc_action_reset() etc.) -
+ * see alchemist_pc.c. Unlike every other REQUEST so far, success isn't
+ * just the CTB ack: xe_guc_pc_start() polls a driver-allocated,
+ * GGTT-mapped shared buffer's global_state field directly (not the CT
+ * response), which real GuC firmware writes as a side effect of
+ * processing SLPC_EVENT_RESET.
+ */
+#define GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST 0x3003u
+#define HOST2GUC_PC_SLPC_REQUEST_EVENT_ID_SHIFT  8u
+#define HOST2GUC_PC_SLPC_REQUEST_EVENT_ID_MASK   0xFFu
+#define   SLPC_EVENT_RESET                  0u
+/* struct slpc_shared_data_header - abi/guc_actions_slpc_abi.h: size(u32)
+ * then global_state(u32) at byte offset 4. */
+#define SLPC_SHARED_DATA_GLOBAL_STATE_OFF   4u
+#define   SLPC_GLOBAL_STATE_RUNNING         3u
 
 #endif

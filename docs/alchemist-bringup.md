@@ -873,3 +873,96 @@ command submission at all:
 This is real, new, unresearched territory (GuC PC's own mmio mailbox
 handshake/register interface for GT frequency requests) - not a command-
 submission problem, and not attempted in this commit.
+
+## Phase 8c: GuC PC (SLPC) startup
+
+Research traced `xe_guc_pc_start()` (`xe_guc_pc.c`) precisely: it sends
+`GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST` (0x3003) with `SLPC_EVENT_RESET`
+over the CTB ring - a message our generic dispatch already ACKs
+correctly - but success isn't gated on that ack at all. The driver
+separately polls a driver-allocated, GGTT-mapped shared buffer's
+`header.global_state` field directly, which real GuC firmware writes as
+a side effect of processing the RESET event. New `alchemist_pc.c`
+performs that same write (`SLPC_GLOBAL_STATE_RUNNING`, real value `3`,
+at byte offset 4 of the buffer whose GGTT address is the RESET event's
+own payload) - not a shortcut, the literal mechanism the real protocol
+depends on.
+
+### A real research/implementation mismatch found by testing
+
+The research (correctly, from the ABI doc block) expected this message
+as `HXG_TYPE_REQUEST`. Live testing showed it never reached that code
+path - a full trace of every H2G message this boot sent showed it
+arriving as `HXG_TYPE_FAST_REQUEST` instead:
+```
+ALCHEMIST-TRACE: H2G msg type=2 action=0x3003 n=3 payload0=0x2 payload1=0x630000
+```
+(`type=2` = `HXG_TYPE_FAST_REQUEST`; `payload0=0x2` decodes to
+`event_id=0` (`SLPC_EVENT_RESET`) `argc=2` - correct - `payload1=0x630000`
+is the shared-data buffer's real GGTT address.) Root cause: `xe_guc_ct.c`'s
+`h2g_write()` only promotes a message to `HXG_TYPE_REQUEST` when the
+caller passes a `g2h_fence` - `pc_action_reset()` calls plain
+`xe_guc_ct_send()` with none, the same pattern already established for
+`XE_GUC_ACTION_SCHED_CONTEXT` in Phase 8. Fixed by checking this action
+regardless of message type in `alchemist_ctb.c`'s dispatch, rather than
+only in the `HXG_TYPE_REQUEST` branch as first implemented.
+
+### Evidence
+
+```
+[   15.500137] xe 0000:00:04.0: [drm] NVM access overridden by jumper
+[   15.500346] [drm] Initialized xe 1.1.0 for 0000:00:04.0 on minor 0
+```
+No more `GuC PC start`/`-EIO` failure anywhere in the log - probe
+continues cleanly past GuC PC into driver initialization.
+
+## Milestone: full `xe` driver probe success, with real command submission
+
+`lspci -k` and `/dev/dri` from inside the guest, this session:
+```
+00:04.0 VGA compatible controller: Intel Corporation DG2 [Arc A380] (rev 08)
+	Subsystem: Red Hat, Inc. Device 1100
+	Kernel driver in use: xe
+	Kernel modules: i915, xe
+=== /dev/dri contents ===
+crw------- 1 root root 226,   0 Aug 25 04:59 card0
+crw------- 1 root root 226, 128 Aug 25 04:59 renderD128
+```
+This is the original Phase 7 target from this project's very first plan
+- reached only now, after real command submission (Phase 8/8b) and GuC
+PC (Phase 8c) turned out to be genuine prerequisites for it, not
+optional extras. The chain from PCI probe through GuC firmware boot,
+CTB, interrupts, GuC-scheduled command submission on two real engine
+classes, and GT power control is clean, with `/dev/dri/card0` and
+`/dev/dri/renderD128` both present.
+
+### FUSE2 (production-hardware fuse) - a small, real correctness fix found along the way
+
+Before this milestone was fully clean, dmesg showed:
+```
+[   15.500835] xe 0000:00:04.0: [drm] Pre-production hardware detected.
+[   15.500837] xe 0000:00:04.0: [drm] *ERROR* Pre-production workarounds for this platform have already been removed.
+```
+Traced to `xe_device.c`'s pre-production check: it reads bit
+`PRODUCTION_HW` (`regs/xe_gt_regs.h`, `FUSE2` register, offset `0x9120`)
+- unset (our generic zero-initialized MMIO buffer) reads as
+pre-production and both logs an `*ERROR*` and taints the kernel
+(`TAINT_MACHINE_CHECK`). Fixed the same way `SG_TILE_ADDR_RANGE`/
+`XEHP_FLAT_CCS_BASE_ADDR` already are - a fixed value set once in
+`alchemist_vram_init()`, no write-hook needed since the driver only
+ever reads it. Confirmed both the error and the `[M]` taint are gone
+after the fix (`Tainted: G     U  W` vs. previously `G   M U  W`).
+
+### Known, separate issue - not investigated further this session
+
+A `BUG: kernel NULL pointer dereference` happens during **shutdown**
+(`xe_display_pm_shutdown` -> `xe_display_flush_cleanup_work`), triggered
+by this session's own guest test script powering off via
+`echo o > /proc/sysrq-trigger` - **after** all of the above evidence is
+already captured. It's inside the display subsystem's cleanup path,
+which isn't implemented yet (Phase 15 - display is correctly reported
+"not present" for now, per `GU_CNTL_PROTECTED`). Plausibly a real
+upstream kernel edge case in how that cleanup path handles a
+never-initialized display rather than something this device model causes
+incorrectly, but flagged honestly as unconfirmed and not chased down -
+worth revisiting once Phase 15 is underway.

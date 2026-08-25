@@ -10,6 +10,7 @@ alchemist_ss.add(files(
   'alchemist_ctb.c',
   'alchemist_guc_proc.c',
   'alchemist_submit.c',
+  'alchemist_pc.c',
 ))
 
 system_ss.add_all(when: 'CONFIG_ALCHEMIST', if_true: alchemist_ss)

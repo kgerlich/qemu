@@ -21,6 +21,10 @@
  * on hardware without Resizable BAR enabled (see the kernel's
  * Documentation/gpu/rfc/i915_small_bar.rst), not a shortcut we invented.
  *
+ * Also sets FUSE2's PRODUCTION_HW bit - xe_device_verify_dontcopy_wa()
+ * reads it to distinguish production from pre-production silicon;
+ * leaving it clear makes the driver log an error and taint the kernel.
+ *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
@@ -39,4 +43,5 @@ void alchemist_vram_init(AlchemistState *s)
 
     alchemist_mmio_store32(s, ALCHEMIST_REG_SG_TILE_ADDR_RANGE(0), tile_addr_range);
     alchemist_mmio_store32(s, ALCHEMIST_REG_XEHP_FLAT_CCS_BASE_ADDR, flat_ccs_base_addr);
+    alchemist_mmio_store32(s, ALCHEMIST_REG_FUSE2, PRODUCTION_HW);
 }

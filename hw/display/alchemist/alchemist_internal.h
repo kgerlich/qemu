@@ -168,6 +168,17 @@ void alchemist_submit_handle_action(AlchemistState *s, uint32_t action,
                                      const uint32_t *payload, uint32_t n);
 
 /*
+ * GuC PC (power/frequency control) - see alchemist_pc.c. Called from
+ * alchemist_ctb_check_h2g() for HXG_TYPE_REQUEST messages whose action
+ * is GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST, after the generic CTB SUCCESS
+ * ack has already been sent (this only performs the additional GGTT
+ * side effect xe_guc_pc_start() actually polls for - see the file
+ * comment).
+ */
+void alchemist_pc_handle_slpc_request(AlchemistState *s,
+                                       const uint32_t *payload, uint32_t n);
+
+/*
  * Satellite GuC coprocessor process - see alchemist_guc_proc.c. Launches a
  * second qemu-system-x86_64 (-machine none -accel tcg -cpu 486, started
  * halted with -S) that will eventually run GuC's real firmware, and
