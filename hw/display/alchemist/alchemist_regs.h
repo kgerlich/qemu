@@ -366,4 +366,35 @@
      (1u << 5) |                                     /* PCI_REBAR_CTRL_NBAR_MASK: 1 resizable BAR */ \
      (ALCHEMIST_REBAR_SIZE_ENCODING << 8))            /* PCI_REBAR_CTRL_BAR_SIZE */
 
+/*
+ * EU (execution unit) native 128-bit instruction format - Gen12.5/DG2.
+ * Bit positions cross-confirmed from Mesa's src/intel/compiler/gen/xe.json,
+ * Intel's IGA (GED library) decode tables, and independently hardware-
+ * verified by hand-decoding real ocloc/iga64-compiled DG2 bytes field-by-
+ * field (see alchemist_eu.c and docs/alchemist-bringup.md) - every field
+ * below matched real compiled output exactly, not derived from a single
+ * source alone. Compact (64-bit) instructions are NOT decoded (a real,
+ * deliberate gap - see alchemist_eu.c's file comment); send/branch
+ * instructions are never compacted on real hardware either, so EOT
+ * recognition is unaffected by this.
+ */
+#define EU_OPCODE_MOV     0x61u  /* Gen12+ only - opcode 1 on Gen9-11 */
+#define EU_OPCODE_ADD     0x40u
+#define EU_OPCODE_SEND    0x31u
+#define EU_OPCODE_SENDC   0x32u
+
+/* Confirmed type-index encodings (hardware-decoded, not just table-listed) */
+#define EU_TYPE_UB  0x0u
+#define EU_TYPE_UW  0x1u
+#define EU_TYPE_UD  0x2u
+#define EU_TYPE_W   0x5u
+#define EU_TYPE_D   0x6u
+#define EU_TYPE_F   0xAu
+
+#define EU_REGFILE_ARF 0u
+#define EU_REGFILE_GRF 1u
+#define EU_ARF_NULL    0u
+
+#define EU_SFID_MESSAGE_GATEWAY 0x3u
+
 #endif

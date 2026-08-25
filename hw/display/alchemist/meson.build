@@ -12,6 +12,7 @@ alchemist_ss.add(files(
   'alchemist_submit.c',
   'alchemist_pc.c',
   'alchemist_ppgtt.c',
+  'alchemist_eu.c',
 ))
 
 system_ss.add_all(when: 'CONFIG_ALCHEMIST', if_true: alchemist_ss)

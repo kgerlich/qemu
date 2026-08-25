@@ -1080,3 +1080,85 @@ by the kernel's own PCI core, `lspci` recognizes the device as a real
 PCIe endpoint, and probe still succeeds cleanly (`/dev/dri/card0`,
 `/dev/dri/renderD128` both present, confirmed unaffected by this
 change).
+
+## Phase 12: EU (execution unit) instruction-set interpreter
+
+The largest, most novel piece of the project so far: a functional
+interpreter for the small subset of the Gen12.5 EU ISA trivial compute/
+shader programs actually use. New `alchemist_eu.h`/`alchemist_eu.c`.
+
+### Research: from three independent sources to hardware-verified ground truth
+
+Bit layout and opcode values were cross-confirmed from Intel's DG2/ACM
+PRM, Mesa's `src/intel/compiler/gen/xe.json` (current upstream), and
+Intel's own IGA assembler source - then, critically, **independently
+verified against real compiled bytes**: `libigc2-tools` (ships `iga64`,
+Intel's real disassembler/assembler) and `intel-ocloc` (Intel's real
+offline OpenCL compiler) are both `apt`-installable on Ubuntu 26.04, no
+GPU hardware required. Compiling a trivial OpenCL kernel with
+`ocloc compile -device dg2` and hand-decoding the real output field by
+field against the derived bit tables found **zero discrepancies** across
+every field checked, for all three instructions this phase implements:
+```
+mov (8|M0) r127.0<1>:ud 0x0:ud                              (thread payload staging)
+61 00 03 80 20 42 05 7f 00 00 00 00 00 00 00 00
+
+add (8|M0) r10.0<1>:d r5.0<8;8,1>:d r6.0<8;8,1>:d
+40 00 03 00 60 06 05 0a 05 05 46 06 05 06 46 00
+
+send.gtwy (1|M0) null r127 null:0 0x0 0x02000010 {EOT,A@1}   (end of thread)
+31 09 00 80 04 00 00 00 0c 7f 20 30 00 00 00 00
+```
+One load-bearing correction found this way: `mov`'s hardware opcode is
+`0x61` on Gen12+/DG2, not `0x01` as on Gen9-11 - a real ISA renumbering
+at Gen12 that would silently misdecode every `mov` if copied from an
+older reference.
+
+`send`'s message descriptor is scattered non-contiguously across the
+instruction word, not stored as a plain 32-bit field - confirmed against
+Mesa's real encoder source (`gen_encoding.cpp`) and then independently
+verified by hand: reassembling the descriptor from the real EOT-send
+bytes above using the documented scatter/gather bit ranges reproduces
+`0x02000010` exactly, matching the real disassembly bit-for-bit.
+
+### Deliberate scope limits (real, not oversights)
+
+- **Only the native (128-bit) instruction format is decoded** - compact
+  (64-bit) format needs five separate lookup tables (32/32/32/16/16
+  entries) to decode at all. This doesn't compromise the phase's actual
+  goal: `send`/branch instructions are *never* compacted on real
+  hardware (stated explicitly in Intel's PRM), so EOT recognition is
+  completely unaffected, and the `mov`/`add` immediate-load patterns
+  needed for thread-payload staging are frequently left uncompacted in
+  real compiled output too (confirmed - both worked examples above are
+  native, not compact, in the real compiler's own output).
+- **Only the "default" regioning pattern is implemented** - a plain,
+  contiguous one-element-per-channel read/write (e.g. `r5.0<8;8,1>:d`).
+  This is exactly what all three real worked examples above use.
+  Non-default regioning (broadcast reads, cross-row access) is flagged
+  `ALCHEMIST_EU_UNSUPPORTED`, not silently mishandled.
+- **`send` only decodes its envelope** (SFID, EOT, payload base
+  register, reassembled descriptor) - it never dispatches a message or
+  performs a memory operation. Nothing in the current dispatch calls
+  `alchemist_eu_run()` yet; that's Phase 13's job (`COMPUTE_WALKER`,
+  the first real caller), which will act on the decoded send based on
+  its `sfid`/`desc`.
+
+### Evidence
+
+Verified with a temporary self-test (added to `realize()`, removed
+before this commit) exercising the exact real byte sequences above
+(hardware-compiled machine code, not hand-constructed synthetic bytes)
+against the real interpreter - all passed on the first attempt:
+```
+ALCHEMIST-TRACE: eu selftest mov imm ok=1
+ALCHEMIST-TRACE: eu selftest add reg+reg ok=1
+ALCHEMIST-TRACE: eu selftest add reg+imm ok=1
+ALCHEMIST-TRACE: eu selftest send eot ok=1 sfid=3 eot=1 desc=0x2000010 payload_reg=127
+ALCHEMIST-TRACE: eu selftest 2-instr program n=2 (want 2) status=0 (want SEND=0) eot=1
+```
+The last case is the real "empty kernel" shape end to end: a 2-
+instruction program (`mov` then `send{EOT}`) run through
+`alchemist_eu_run()`, correctly executing both instructions and
+stopping on the send with `EOT` set. Full probe success confirmed
+unaffected by this change.
