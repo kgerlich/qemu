@@ -29,8 +29,12 @@
  *   additionally routed through alchemist_gpgpu.c first - see below):
  *   emit_job_gen12_render_compute(), a 9-dword QW PIPE_CONTROL
  *   breadcrumb write via emit_pipe_imm_ggtt(), then emit_user_interrupt().
- * - XE_ENGINE_CLASS_COPY: __emit_job_gen12_simple(), a different,
- *   shorter 8-dword MI_FLUSH_DW breadcrumb, no PIPE_CONTROL at all.
+ * - XE_ENGINE_CLASS_COPY: an MI_FLUSH_DW breadcrumb instead of PIPE_CONTROL
+ *   (alchemist_regs.h's MI_SIMPLE_EPILOGUE_DWORDS comment has the full
+ *   real shape - it differs between a plain job and a real
+ *   xe_migrate.c-driven VM_BIND/copy job, which is why only the
+ *   MI_FLUSH_DW + suffix immediately before the anchor is checked, not
+ *   whatever precedes it).
  *
  * Both endings share the exact same 3-dword emit_user_interrupt()
  * suffix (MI_USER_INTERRUPT, MI_ARB_ON_OFF|ENABLE, MI_ARB_CHECK), so
@@ -41,7 +45,7 @@
  * sometimes followed by a single MI_NOOP pad dword before tail -
  * confirmed live (see docs/alchemist-bringup.md), which is exactly why
  * this searches for the anchor within a small tolerance instead of
- * assuming a fixed offset (the copy epilogue is 32 bytes, already
+ * assuming a fixed offset (the copy epilogue is 28 bytes, already
  * aligned, but the same tolerant search costs nothing extra and needs
  * no special-casing).
  *
@@ -150,13 +154,19 @@ static bool submit_epilogue_simple(AlchemistState *s, uint64_t ring_addr,
                         MI_SIMPLE_EPILOGUE_DWORDS, e)) {
         return false;
     }
-    if (e[0] != MI_ARB_OFF ||
-        e[1] != MI_FLUSH_DW_STOREDW_IMM ||
-        e[5] != MI_USER_INTERRUPT) {
+    /* e[0..3] = the real completion MI_FLUSH_DW (header, addr_lo, addr_hi,
+     * data); e[4] = MI_USER_INTERRUPT, the first dword of the shared
+     * 3-dword suffix (e[5]/e[6] = MI_ARB_ON_OFF|ENABLE / MI_ARB_CHECK,
+     * not independently checked - see alchemist_regs.h's comment for why
+     * MI_ARB_OFF itself isn't checked here, and why only
+     * MI_FLUSH_DW_CCS/MI_INVALIDATE_TLB are masked out of the header
+     * comparison). */
+    if ((e[0] & ~(MI_FLUSH_DW_CCS | MI_INVALIDATE_TLB)) != MI_FLUSH_DW_STOREDW_IMM ||
+        e[4] != MI_USER_INTERRUPT) {
         return false;
     }
-    *seqno_addr = e[2] & ~(uint64_t)MI_FLUSH_DW_USE_GTT_BIT;
-    *seqno = e[4];
+    *seqno_addr = e[1] & ~(uint64_t)MI_FLUSH_DW_USE_GTT_BIT;
+    *seqno = e[3];
     return true;
 }
 

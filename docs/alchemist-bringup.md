@@ -1418,25 +1418,84 @@ device's reported platform/device info end to end - not a prebuilt
 binary, a fresh compile against everything this device model reports
 about itself.
 
-### Known remaining gap: a kernel-submitted "pulse"/heartbeat job stalls dispatch
+### Resolved: the "pulse"/heartbeat-looking job was xe_migrate.c's real migrate queue
 
-`clEnqueueNDRangeKernel()`/`clFinish()` on the real kernel above does not
-yet complete - the guest kernel driver repeatedly logs a *different*,
-kernel-internal submission stalling and resetting in a loop:
-```
-xe 0000:00:04.0: [drm] Tile0: GT0: Timedout job: seqno=4294967169, lrc_seqno=4294967169, guc_id=0, flags=0x43 in no process [-1]
-xe 0000:00:04.0: [drm] Tile0: GT0: Kernel-submitted job timed out
-xe 0000:00:04.0: [drm] Tile0: GT0: trying reset from guc_exec_queue_timedout_job [xe]
-xe 0000:00:04.0: [drm] Tile0: GT0: reset done
-```
-`in no process [-1]` and the seqno values themselves (`4294967169` =
-`0xFFFFFFC1`, and later attempts at `0xFFFFFFD2`/`0xFFFFFFD3` - all near
-`UINT32_MAX`, not small sequential job numbers) point at a
-kernel-internal keepalive/health-check mechanism distinct from both the
-Phase 8 workaround-job path and Phase 13's `COMPUTE_WALKER` dispatch
-path - not yet root-caused. This is flagged honestly as the next
-concrete blocker, not guessed at or worked around: real evidence (which
-exact "pulse"/heartbeat submission this is, what ring content it uses,
-why our existing epilogue-completion mechanism doesn't already handle
-it) is needed before implementing a fix, the same discipline used for
+The `Timedout job: ... guc_id=0, flags=0x43 in no process [-1]` /
+`Kernel-submitted job timed out` / reset-loop reported above was tracked
+down with live ring-content tracing (added, then stripped before this
+commit, same convention as every self-test in this project). `flags=0x43`
+decodes exactly to `EXEC_QUEUE_FLAG_KERNEL | EXEC_QUEUE_FLAG_PERMANENT |
+EXEC_QUEUE_FLAG_MIGRATE` (`xe_exec_queue_types.h`) - this is
+`xe_migrate.c`'s own permanent, kernel-owned copy-engine exec queue
+(`m->q`), not a "pulse"/heartbeat mechanism at all. It handles real
+`VM_BIND`/buffer-population work (e.g. `clCreateBuffer(...,
+CL_MEM_COPY_HOST_PTR, ...)`'s initial host-to-device copy) and was
+submitting real jobs the whole time - `alchemist_submit.c`'s COPY-class
+epilogue detection (unchanged since Phase 8) was silently failing to
+recognize *all* of them, not just one; the "seqno near `UINT32_MAX`"
+red herring was simply the real seqno value the driver happened to
+assign (confirmed byte-exact: the reported seqno matched the epilogue's
+own decoded data field precisely, proving alignment was never the
+problem).
+
+Root cause, found by dumping raw ring content around the (correctly
+anchor-found) epilogue and cross-referencing `xe_ring_ops.c`/
+`xe_migrate.c` source directly: migrate-queue jobs
+(`emit_migration_job_gen12()`) use a real, richer shape than the
+Phase 8-era "simple" epilogue assumed - two `MI_BATCH_BUFFER_START`
+jumps, an intermediate "start seqno" `MI_STORE_DATA_IMM` breadcrumb
+wrapped in `preparser_disable(true/false)` (`MI_ARB_CHECK | BIT(8) |
+state` - explaining the `0x0280010x`-pattern dwords the raw dump
+showed), and *then* the real completion `MI_FLUSH_DW`, so
+`MI_ARB_OFF` is no longer the dword immediately preceding it as the
+old fixed 8-dword window assumed. Since only the *last* `MI_FLUSH_DW` +
+the shared 3-dword suffix are ever needed for completion - the
+intermediate breadcrumb, both batches' content, and `MI_ARB_OFF`'s
+exact position are all irrelevant to that - the fix drops the
+`MI_ARB_OFF` dword from the window (8 → 7 dwords,
+`MI_SIMPLE_EPILOGUE_DWORDS` in `alchemist_regs.h`), which correctly
+handles the plain and migrate job shapes uniformly with no
+special-casing.
+
+`MI_FLUSH_DW`'s header also carries real, independently-varying
+optional flags (`instructions/xe_mi_commands.h`:
+`MI_FLUSH_DW_CCS = REG_BIT(16)`, `MI_INVALIDATE_TLB = REG_BIT(18)`) that
+`job->migrate_flush_flags` sets per-job depending on what's actually
+being flushed - confirmed live with both bits clear, `MI_FLUSH_DW_CCS`
+alone, and both set together, all for real, successive migrate jobs in
+the same boot. Only these two confirmed-varying bits are masked out of
+the header comparison; anything else still has to match exactly.
+
+**Evidence**: with the fix applied, a full guest boot through the same
+real OpenCL test shows **zero** `Timedout job`/`Kernel-submitted job
+timed out` messages - the entire reset-loop is gone, and every migrate
+job (dozens, across `CL-TEST`'s full context/queue/program/buffer setup)
+now completes correctly.
+
+### New gap found while chasing this: the compute exec_queue's own PPGTT root is unbound
+
+With the migrate-queue fix in place, `clEnqueueNDRangeKernel()`/
+`clFinish()` still doesn't complete - but silently now, no reset-loop or
+kernel warning at all. Live tracing into `alchemist_gpgpu.c`'s ring walk
+found the real cause: a genuine, newly-registered `XE_ENGINE_CLASS_COMPUTE`
+context (`guc_id=8`, distinct from the two Phase 8/13-era probe-time
+compute contexts) submits a job whose ring correctly contains a real
+`MI_BATCH_BUFFER_START` (matching `__emit_job_gen12_render_compute()`'s
+real shape exactly - `preparser_disable`/`emit_store_imm_ggtt`/etc. all
+decoded and matched byte-for-byte against `xe_ring_ops.c`, confirming
+Phase 13's ring-walker logic itself is correct) with the ppgtt-flag bit
+set and a real, canonical (sign-extended) 48-bit GPU VA
+(`0xffffd556aa740000` - `DG2::capabilityTable.gpuAddressSpace =
+MemoryConstants::max48BitAddress` confirms this is real, valid DG2
+addressing, not corruption). `alchemist_ppgtt_read()` fails to resolve
+it - traced all the way down to the root: `guc_id=8`'s own
+`CTX_PDP0_UDW/LDW` resolves to a real, plausible GGTT address, but that
+root page table has **zero non-zero entries at all** - a completely
+unbound PPGTT, not a missing leaf or a wrong-level miss.
+
+Not yet root-caused further: whether this is a real VM-sharing mismatch
+(this exec queue's LRC pointing at a different, as-yet-unbound `xe_vm`
+than whatever VM the kernel/buffer content was actually bound into), an
+ordering issue specific to this device model, or something else, is
+flagged honestly as the next concrete blocker - the same discipline used for
 every gap above. No code changes were made for this gap in this session.

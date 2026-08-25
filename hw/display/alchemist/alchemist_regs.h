@@ -348,15 +348,41 @@
 #define MI_ARB_CHECK                        0x02800000u
 
 /*
- * The "simple" ring epilogue (xe_ring_ops.c __emit_job_gen12_simple(),
- * used by XE_ENGINE_CLASS_COPY and others with no EU/aux handling) - an
- * MI_FLUSH_DW breadcrumb instead of render/compute's PIPE_CONTROL, 8
- * dwords not 9 (already QWORD-aligned, no pad dword expected, but
- * alchemist_submit.c still searches for MI_ARB_CHECK rather than
- * assuming a fixed offset, same as the render/compute epilogue).
+ * The "simple" ring epilogue (xe_ring_ops.c, XE_ENGINE_CLASS_COPY) - an
+ * MI_FLUSH_DW breadcrumb instead of render/compute's PIPE_CONTROL.
+ * __emit_job_gen12_simple() itself (a plain job with no VM_BIND/migrate
+ * content) is a fixed [MI_ARB_OFF, MI_FLUSH_DW(4dw), suffix(3dw)] = 8
+ * dwords, but xe_migrate.c's migrate/VM_BIND-update jobs
+ * (emit_migration_job_gen12(), also XE_ENGINE_CLASS_COPY) are a much
+ * richer, real, distinct shape: two MI_BATCH_BUFFER_START jumps, an
+ * intermediate "start seqno" MI_FLUSH_DW breadcrumb wrapped in
+ * preparser_disable(true/false), and only THEN the real completion
+ * MI_FLUSH_DW - so MI_ARB_OFF is no longer immediately adjacent to the
+ * completion write. Confirmed directly against a real
+ * `clCreateBuffer(CL_MEM_COPY_HOST_PTR)`-triggered migrate job that our
+ * previous fixed 8-dword/ARB_OFF-anchored window silently failed to
+ * recognize, stalling job completion (`docs/alchemist-bringup.md`).
+ * Since only the *last* MI_FLUSH_DW + the fixed 3-dword suffix is ever
+ * needed for completion (the intermediate "start seqno" write, any
+ * batch content, and MI_ARB_OFF's exact position are all irrelevant to
+ * *that*), dropping the leading MI_ARB_OFF dword from the window - 7
+ * dwords, not 8 - handles both the plain and migrate job shapes
+ * uniformly, without special-casing either.
+ *
+ * MI_FLUSH_DW's header also carries real, independently-varying
+ * optional flags (instructions/xe_mi_commands.h) - migrate jobs pass
+ * `job->migrate_flush_flags` through (MI_FLUSH_DW_CCS and/or
+ * MI_INVALIDATE_TLB, set or clear depending on what the specific job
+ * touches - confirmed live with both bits clear, MI_FLUSH_DW_CCS alone,
+ * and both set together), which the plain job's fixed
+ * emit_flush_imm_ggtt() call never sets - so only these two flag bits,
+ * actually confirmed varying, are masked out of the comparison;
+ * anything else still has to match exactly, not silently tolerated.
  */
-#define MI_SIMPLE_EPILOGUE_DWORDS           8u
+#define MI_SIMPLE_EPILOGUE_DWORDS           7u
 #define MI_FLUSH_DW_STOREDW_IMM             0x13004002u
+#define MI_FLUSH_DW_CCS                     0x00010000u  /* REG_BIT(16) */
+#define MI_INVALIDATE_TLB                   0x00040000u  /* REG_BIT(18) */
 #define MI_FLUSH_DW_USE_GTT_BIT             0x00000004u
 #define XE_ENGINE_CLASS_COPY                3u
 #define INTR_BCS0                           (1u << 15)
