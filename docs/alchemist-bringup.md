@@ -1029,3 +1029,54 @@ address bit 12 - `alchemist_ppgtt.c`'s file comment documents this
 explicitly. The straightforward interpretation (no special-case masking)
 is implemented; PAT/cacheability bits are never modeled elsewhere in
 this project either, so this is consistent with that, not a deviation.
+
+## Phase 11: Resizable BAR capability
+
+Scope turned out larger than expected: `pcie_add_capability()` (needed
+for the ReBAR extended capability) asserts `pci_is_express(dev)` -
+exposing it requires the device to actually be a PCI Express endpoint,
+not conventional PCI as it had been modeled since Phase 1. Confirmed
+against source that real DG2 hardware genuinely is PCIe (unconditionally,
+not a hybrid device), so this is a real correction, not scope creep for
+its own sake - the device's `TypeInfo` now declares only
+`INTERFACE_PCIE_DEVICE` (dropping `INTERFACE_CONVENTIONAL_PCI_DEVICE`),
+and `pcie_endpoint_cap_init()` adds the base PCI Express Capability at
+offset `0x80` (the `hw/display/bochs-display.c` precedent, guarded the
+same way by `pci_bus_is_express()`).
+
+Also confirmed from source (`xe_pci_rebar.c`'s `xe_pci_rebar_resize()`)
+that the driver's own resize attempt is conditional: it reads the
+capability's advertised max size and only calls `pci_resize_resource()`
+if that max exceeds the BAR's *current* size. QEMU's PCI core has no
+support for actually resizing a registered BAR's backing `MemoryRegion`
+at runtime, and building that from scratch was out of scope for what
+this milestone needs - so rather than a partial/fake "resize" implementation,
+BAR2 (`ALCHEMIST_VRAM_SIZE`, `alchemist_internal.h`) was bumped from
+256MB to 1GB (matching our full modeled VRAM tile size), and the
+Resizable BAR capability reports that same 1GB as both the *only
+supported* and *current* size. The driver's resize call sees
+`current == max` and correctly no-ops - a real, valid hardware
+configuration (a BIOS-preconfigured-large-BAR system, exactly the
+working case from `intel/compute-runtime#905`), not a shortcut. Earlier
+phases' 256MB BAR (and the "Small BAR device" fallback it exercised) was
+also real and valid, just a different configuration than this phase
+needs.
+
+### Evidence
+
+`lspci -vvv` from inside the guest (temporarily extended the guest test
+harness's init script to capture this, not part of the committed device
+source):
+```
+	Region 2: Memory at e0040000000 (64-bit, prefetchable) [size=1G]
+	Capabilities: [80] Express (v2) Root Complex Integrated Endpoint, IntMsgNum 0
+	...
+	Capabilities: [100 v1] Physical Resizable BAR
+		BAR 2: current size: 1GB, supported: 1GB
+	Kernel driver in use: xe
+```
+Exactly as designed: the capability is correctly discovered and decoded
+by the kernel's own PCI core, `lspci` recognizes the device as a real
+PCIe endpoint, and probe still succeeds cleanly (`/dev/dri/card0`,
+`/dev/dri/renderD128` both present, confirmed unaffected by this
+change).

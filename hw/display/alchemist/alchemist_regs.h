@@ -343,4 +343,27 @@
  * XE_PDE_64K set (each leaf entry then covers 64K, table covers 32MB). */
 #define XE_PPGTT_COMPACT_LEAF_SHIFT         16u
 
+/*
+ * Resizable BAR (PCIe ECN "Resizable BAR Capability" / regs/xe_bars.h's
+ * LMEM_BAR=2) - xe_pci_rebar.c's xe_pci_rebar_resize() actively calls the
+ * kernel's pci_resize_resource() at probe if BAR2 is smaller than the
+ * capability's advertised max, and real DG2 hardware always exposes this
+ * capability (not just when BIOS pre-sizes the BAR large). We report the
+ * one size we actually back (ALCHEMIST_VRAM_SIZE, see alchemist_internal.h)
+ * as both the only supported size and the current size, so the driver's
+ * own resize call sees current==max and no-ops - a real, correct
+ * configuration (matching a BIOS-preconfigured-large-BAR system), not a
+ * partial implementation pretending to support live resize.
+ *
+ * Standard ECN encoding (not xe-specific): a size field value V means
+ * 1MB << V; CAP's bit (4+V) advertises support for that size. 1GB = V=10.
+ */
+#define ALCHEMIST_REBAR_BAR_INDEX      2u
+#define ALCHEMIST_REBAR_SIZE_ENCODING  10u  /* 1MB << 10 == 1GB */
+#define ALCHEMIST_REBAR_CAP_VAL        (1u << (4u + ALCHEMIST_REBAR_SIZE_ENCODING))
+#define ALCHEMIST_REBAR_CTRL_VAL \
+    (ALCHEMIST_REBAR_BAR_INDEX |                    /* PCI_REBAR_CTRL_BAR_IDX */ \
+     (1u << 5) |                                     /* PCI_REBAR_CTRL_NBAR_MASK: 1 resizable BAR */ \
+     (ALCHEMIST_REBAR_SIZE_ENCODING << 8))            /* PCI_REBAR_CTRL_BAR_SIZE */
+
 #endif

@@ -19,11 +19,13 @@
 #include "qemu/units.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pcie.h"
 #include "hw/pci/msi.h"
 #include "qom/object.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "alchemist_internal.h"
+#include "alchemist_regs.h"
 
 #define TYPE_PCI_ALCHEMIST_DEVICE "alchemist"
 DECLARE_INSTANCE_CHECKER(AlchemistState, ALCHEMIST,
@@ -99,6 +101,37 @@ static void pci_alchemist_realize(PCIDevice *pdev, Error **errp)
                       PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
 
     /*
+     * Real DG2 is unconditionally a PCI Express device - pcie_add_capability()
+     * (used below for Resizable BAR) requires it. bochs-display.c is the
+     * precedent for the pci_bus_is_express() guard + offset 0x80 convention
+     * (safe against our existing MSI capability, which lands well before it).
+     */
+    if (pci_bus_is_express(pci_get_bus(pdev))) {
+        if (pcie_endpoint_cap_init(pdev, 0x80) < 0) {
+            error_setg(errp, "alchemist: pcie_endpoint_cap_init failed");
+            return;
+        }
+
+        /*
+         * Resizable BAR (BAR2/GMADR) - xe_pci_rebar.c's xe_pci_rebar_resize()
+         * reads this at probe. We report our one real, fixed VRAM size
+         * (ALCHEMIST_VRAM_SIZE) as both the only supported and current
+         * size, so the driver's own resize call sees current==max and
+         * correctly no-ops - see alchemist_regs.h/alchemist_internal.h for
+         * the full reasoning. pcie_add_capability() defaults the whole
+         * region to read-only, which is correct here: we don't implement
+         * live resize, so the control register genuinely shouldn't accept
+         * guest writes.
+         */
+        pcie_add_capability(pdev, PCI_EXT_CAP_ID_REBAR, 1,
+                             PCI_CONFIG_SPACE_SIZE, 12);
+        pci_set_long(pdev->config + PCI_CONFIG_SPACE_SIZE + 4,
+                     ALCHEMIST_REBAR_CAP_VAL);
+        pci_set_long(pdev->config + PCI_CONFIG_SPACE_SIZE + 8,
+                     ALCHEMIST_REBAR_CTRL_VAL);
+    }
+
+    /*
      * xe_irq_install() falls back to a single plain MSI vector whenever
      * pci_msix_vec_count() reports no MSI-X capability (-EINVAL) - see
      * xe_irq_msix_init() upstream - so that's all we need to provide.
@@ -153,7 +186,7 @@ static const TypeInfo alchemist_types[] = {
         .instance_size = sizeof(AlchemistState),
         .class_init    = alchemist_class_init,
         .interfaces    = (const InterfaceInfo[]) {
-            { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+            { INTERFACE_PCIE_DEVICE },
             { },
         },
     }

@@ -15,11 +15,14 @@
  * base set to the same 1GB offset, i.e. no space reserved for CCS
  * metadata - all of the (fictional) 1GB tile is usable.
  *
- * Our real BAR2 (GMADR/LMEM aperture) is smaller than that at 256MB, so
- * vram_region_init() clamps usable size down to what's actually mapped
- * and logs "Small BAR device" - this is DG2's real, documented behavior
- * on hardware without Resizable BAR enabled (see the kernel's
- * Documentation/gpu/rfc/i915_small_bar.rst), not a shortcut we invented.
+ * BAR2 (GMADR/LMEM aperture, ALCHEMIST_VRAM_SIZE) matches this same 1GB
+ * exactly, as of Phase 11 (Resizable BAR) - earlier phases used a
+ * smaller 256MB BAR2 and exercised vram_region_init()'s real "Small BAR
+ * device" fallback (DG2's real, documented behavior on hardware without
+ * Resizable BAR enabled, see the kernel's
+ * Documentation/gpu/rfc/i915_small_bar.rst) instead; both are real,
+ * valid hardware configurations, see alchemist_internal.h for why
+ * Phase 11 onward needs the larger one.
  *
  * Also sets FUSE2's PRODUCTION_HW bit - xe_device_verify_dontcopy_wa()
  * reads it to distinguish production from pre-production silicon;

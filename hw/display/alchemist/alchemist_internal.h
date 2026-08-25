@@ -20,11 +20,19 @@
 #define ALCHEMIST_MMIO_SIZE (16 * MiB)
 
 /*
- * BAR2 (GMADR): local-memory/VRAM aperture. Real DG2 cards expose several
- * GB here; we start intentionally small and revisit if a later phase's
- * VRAM-size probe rejects it.
+ * BAR2 (GMADR): local-memory/VRAM aperture. Matches the 1GB tile size
+ * alchemist_vram_init() reports (our full modeled VRAM capacity, not a
+ * "small BAR" subset of it) - Phase 11 needs this: the Resizable BAR
+ * capability (alchemist_regs.h) reports this same 1GB as both the only
+ * supported and current size, so compute-runtime's real BAR-size check
+ * (the ReBAR-disabled failure mode this phase exists for - see
+ * docs/alchemist-bringup.md) sees a real, already-adequate BAR, and
+ * xe_pci_rebar_resize()'s own resize attempt correctly no-ops (current
+ * already == max). Earlier phases used 256MB and exercised the real
+ * "Small BAR device" driver fallback instead - both are real, valid
+ * hardware configurations; this one is what Phase 11 onward needs.
  */
-#define ALCHEMIST_VRAM_SIZE (256 * MiB)
+#define ALCHEMIST_VRAM_SIZE (1 * GiB)
 
 /*
  * CTB (Command Transport Buffer) registration state - the GGTT addresses
