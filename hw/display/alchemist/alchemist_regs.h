@@ -311,4 +311,36 @@
 #define SLPC_SHARED_DATA_GLOBAL_STATE_OFF   4u
 #define   SLPC_GLOBAL_STATE_RUNNING         3u
 
+/*
+ * PPGTT (per-process page tables) - regs/xe_gtt_defs.h, xe_pt.c, xe_vm.c.
+ * A real 4-level radix tree (DG2: xe->info.vm_max_level == 3, i.e.
+ * levels 0-3; xe_pt.c's xe_normal_pt_shifts[] = {12,21,30,39,48}), 9-bit
+ * index per level, 4KB page-table nodes, 8-byte entries - see
+ * alchemist_ppgtt.c. Bit positions genuinely differ from GGTT's (e.g.
+ * the VRAM/local-memory indicator is bit 11 here, not GGTT's bit 1) -
+ * do not reuse the XE_GGTT_PTE_* macros above for PPGTT decode.
+ *
+ * Root address is a per-context LRC field, CTX_PDP0_UDW/_LDW
+ * (regs/xe_lrc_layout.h dword indices 0x31/0x33), written once at
+ * context/LRC init the same way CTX_RING_START etc. already are.
+ */
+#define CTX_PDP0_UDW_OFF                    0xC4u   /* dword (0x30+1) */
+#define CTX_PDP0_LDW_OFF                    0xCCu   /* dword (0x32+1) */
+
+#define XE_PPGTT_MAX_LEVEL                  3u      /* DG2 vm_max_level */
+#define XE_PPGTT_PAGE_TABLE_ENTRIES         512u    /* 4KB / 8 bytes */
+#define XE_PPGTT_LEVEL_SHIFT(level)         (12u + 9u * (level))
+
+#define XE_PAGE_RW                          (1ull << 1)
+#define XE_PDE_64K                          (1ull << 6)   /* level-1 PDE: child table is compact (64K-leaf) */
+#define XE_PDE_PS_2M                        (1ull << 7)   /* level-1 PDE: this entry is a 2MB leaf, not a pointer */
+#define XE_PDPE_PS_1G                       (1ull << 7)   /* level-2 PDE: this entry is a 1GB leaf, not a pointer */
+#define XE_PTE_PS64                         (1ull << 8)   /* level-0 PTE: hint only, doesn't affect address decode */
+#define XE_PPGTT_PTE_DM                     (1ull << 11)  /* leaf: address is a VRAM/BAR2 offset */
+
+/* xe_compact_pt_shifts[] - the level-0 (leaf) shift becomes 16 instead
+ * of 12 whenever the level-1 PDE pointing at that leaf table had
+ * XE_PDE_64K set (each leaf entry then covers 64K, table covers 32MB). */
+#define XE_PPGTT_COMPACT_LEAF_SHIFT         16u
+
 #endif

@@ -125,6 +125,21 @@ bool alchemist_ggtt_write(AlchemistState *s, uint64_t ggtt_addr,
                            const void *buf, uint64_t len);
 
 /*
+ * PPGTT (per-process page tables) translation - see alchemist_ppgtt.c.
+ * Like GGTT, a pure read-side decode of page-table entries the guest
+ * already wrote as plain memory stores - no write-side hook needed. The
+ * root page table's GGTT address is looked up from `guc_id`'s LRC
+ * (CTX_PDP0, populated when the context is registered - see
+ * alchemist_submit.c), so `guc_id` must already be a known, registered
+ * context or this returns false, same "no hidden fallback" contract as
+ * alchemist_ggtt_read/write.
+ */
+bool alchemist_ppgtt_read(AlchemistState *s, uint32_t guc_id,
+                           uint64_t gpu_va, void *buf, uint64_t len);
+bool alchemist_ppgtt_write(AlchemistState *s, uint32_t guc_id,
+                            uint64_t gpu_va, const void *buf, uint64_t len);
+
+/*
  * GT interrupt cascade - see alchemist_irq.c. Raises the one interrupt
  * source we currently model (GuC2Host) through the real multi-level
  * status/identity register chain, then fires the actual MSI.

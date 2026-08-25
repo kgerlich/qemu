@@ -966,3 +966,66 @@ upstream kernel edge case in how that cleanup path handles a
 never-initialized display rather than something this device model causes
 incorrectly, but flagged honestly as unconfirmed and not chased down -
 worth revisiting once Phase 15 is underway.
+
+## Phase 10: PPGTT (per-process page tables) read-only walker
+
+New `alchemist_ppgtt.c` - a real 4-level radix-tree walker (DG2:
+`vm_max_level == 3`, levels 0-3, 9-bit index per level, 4KB nodes,
+8-byte entries), confirmed from `xe_vm.c`/`xe_pt.c`/`regs/xe_gtt_defs.h`.
+Like GGTT, this is a pure read-side decode - `VM_BIND` is 100% CPU-side
+for a fresh, non-rebind bind (the driver just writes PTE qwords directly
+into memory we already expose via `xe_migrate_update_pgtables_cpu()`),
+so there's no write-side hook to add. The root page table's GGTT address
+is looked up from the same per-`guc_id` LRC tracking `alchemist_submit.c`
+already maintains for command submission (Phase 8) - `CTX_PDP0_UDW/_LDW`,
+found the same way `CTX_RING_START` etc. already are.
+
+Handles the two real leaf shapes DG2 needs: plain 4K/64K-compact leaves
+(walking all the way to level 0, tracking whether the level-1 PDE's
+`XE_PDE_64K` bit switches the leaf table to 64K-granularity) and 2MB/1GB
+huge-page leaves (a level-1/level-2 PDE's `PS` bit reinterpreting that
+slot as a direct leaf instead of a pointer, an early return before
+reaching level 0).
+
+### Verification: no real PPGTT traffic exists yet to test against
+
+Nothing in the current dispatch calls this code yet - that's Phase 13
+(compute), the first real consumer. Real `VM_BIND` traffic needs an
+actual userspace driver (Vulkan/OpenCL) issuing buffer allocations,
+which doesn't exist in the guest until then. Rather than leave this
+unverified, or introduce new qtest infrastructure this project hasn't
+used yet, a **temporary, self-contained C-side test** (added to
+`pci_alchemist_realize()`, removed before this commit - same
+add-then-strip convention used throughout this project) constructed a
+synthetic 4-level tree directly (GGTT-mapping scratch VRAM pages for
+each node, using context slot 63 - unused by the real guest boot
+sequence) and ran it through the real `alchemist_ppgtt_read()`:
+```
+ALCHEMIST-TRACE: ppgtt selftest VA=0 ok=1 data=PPGTTOK! (want PPGTTOK!)
+ALCHEMIST-TRACE: ppgtt selftest unmapped VA=0x1000 ok=0 (want 0)
+ALCHEMIST-TRACE: ppgtt selftest 2MB-leaf VA=0x40200000 ok=1 data=HUGE2M!! (want HUGE2M!!)
+```
+Three real, distinct code paths verified: the full 4-level walk down to
+an ordinary 4K leaf, correct rejection of a present-but-absent entry
+(level-0 entry deliberately left unmapped), and the level-1 `PS`-bit
+2MB-huge-leaf early return (an untested path the first version of this
+test didn't even reach - see below).
+
+**A real bug the test itself had, caught before it could hide anything**:
+the first version ran the 2MB-leaf case *before* marking the synthetic
+context registered, so `ppgtt_get_root()` correctly rejected it
+(`ok=0`) - not a walker bug, a test-ordering bug. Reordering (register
+first) immediately turned it into a real pass, `HUGE2M!!` read back
+byte-exact.
+
+Full end-to-end verification against a real, guest-driven `VM_BIND` is
+deferred to Phase 13, where `COMPUTE_WALKER` becomes the first real
+caller of this code.
+
+Real, honestly-flagged open question (not resolved, not guessed at):
+whether `XE_PPGTT_PDE_PDPE_PAT2` (bit 12) can ever be set on a real DG2
+directory entry in a way that would collide with that entry's own
+address bit 12 - `alchemist_ppgtt.c`'s file comment documents this
+explicitly. The straightforward interpretation (no special-case masking)
+is implemented; PAT/cacheability bits are never modeled elsewhere in
+this project either, so this is consistent with that, not a deviation.
