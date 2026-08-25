@@ -62,6 +62,8 @@ typedef struct AlchemistGucProc {
 
 typedef struct AlchemistContext {
     bool registered;
+    uint32_t engine_class; /* xe_engine_class - which ring-epilogue shape
+                             * and interrupt identity this context uses */
     uint64_t lrc_ggtt_addr; /* PPHWSP GGTT address - xe_lrc_ggtt_addr() */
 } AlchemistContext;
 
@@ -139,6 +141,7 @@ bool alchemist_irq_is_status_reg(hwaddr addr);
 void alchemist_irq_status_write(AlchemistState *s, hwaddr addr, uint64_t val);
 void alchemist_irq_raise_guc2host(AlchemistState *s);
 void alchemist_irq_raise_rcs0(AlchemistState *s);
+void alchemist_irq_raise_bcs0(AlchemistState *s);
 void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
 
 /*

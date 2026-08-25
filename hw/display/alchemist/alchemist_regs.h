@@ -268,6 +268,21 @@
      0x00000080u /* FLUSH_ENABLE */   | 0x00100000u /* CS_STALL */)
 #define MI_USER_INTERRUPT                   0x01000000u
 #define MI_ARB_ON_OFF_ENABLE                0x04000001u
+#define MI_ARB_OFF                          0x04000000u
 #define MI_ARB_CHECK                        0x02800000u
+
+/*
+ * The "simple" ring epilogue (xe_ring_ops.c __emit_job_gen12_simple(),
+ * used by XE_ENGINE_CLASS_COPY and others with no EU/aux handling) - an
+ * MI_FLUSH_DW breadcrumb instead of render/compute's PIPE_CONTROL, 8
+ * dwords not 9 (already QWORD-aligned, no pad dword expected, but
+ * alchemist_submit.c still searches for MI_ARB_CHECK rather than
+ * assuming a fixed offset, same as the render/compute epilogue).
+ */
+#define MI_SIMPLE_EPILOGUE_DWORDS           8u
+#define MI_FLUSH_DW_STOREDW_IMM             0x13004002u
+#define MI_FLUSH_DW_USE_GTT_BIT             0x00000004u
+#define XE_ENGINE_CLASS_COPY                3u
+#define INTR_BCS0                           (1u << 15)
 
 #endif

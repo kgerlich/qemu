@@ -831,3 +831,45 @@ milestone doesn't depend on it:
 [   16.568477] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: hwe bcs0: emit_wa_job failed (-ETIME) guc_id=3
 ```
 (same stall, same guc_id, across two independent boots - not a fluke.)
+
+## Phase 8b: extend command submission to bcs0 (blitter/copy engine)
+
+`alchemist_submit.c` tracks each context's `engine_class` (already present
+in `GUC_ACTION_REGISTER_CONTEXT`'s payload, previously ignored) and
+dispatches to one of two recognized ring-epilogue shapes, confirmed
+directly from `xe_ring_ops.c`:
+
+- `XE_ENGINE_CLASS_RENDER` -> `emit_job_gen12_render_compute()`'s 9-dword
+  `PIPE_CONTROL`-based epilogue (already implemented in Phase 8).
+- `XE_ENGINE_CLASS_COPY` -> `__emit_job_gen12_simple()`'s different,
+  shorter 8-dword `MI_FLUSH_DW`-based epilogue - no `PIPE_CONTROL` at
+  all, confirmed literal encoding from source
+  (`emit_flush_imm_ggtt()`/`emit_store_imm_ggtt()`).
+
+Both endings share the identical 3-dword `emit_user_interrupt()` suffix
+(`MI_USER_INTERRUPT`, `MI_ARB_ON_OFF|ENABLE`, `MI_ARB_CHECK`) - the
+tail-search logic added in Phase 8 (tolerating the QWORD-alignment pad
+dword) is reused unchanged as a shared anchor-finder, then the
+class-appropriate epilogue shape is checked ending at that anchor.
+`alchemist_irq.c` gained a third raised source, `INTR_BCS0` (bit 15 of
+the same bank-0 `GT_INTR_DW` register `INTR_GUC`/`INTR_RCS0` already
+use - confirmed from `regs/xe_irq_regs.h` that Copy/Render/GuC don't
+collide in that bank; Video classes use different, lower bits that would
+collide with `INTR_RCS0` were they in the same bank, confirming they
+must live in a different bank not yet modeled).
+
+### Evidence
+
+Both engine classes' workaround jobs now complete cleanly - zero
+`emit_wa_job`/`-ETIME` failures anywhere in the log, reproduced across
+two independent clean boots. Probe now advances into a completely
+different, unrelated subsystem - GuC PC (power/frequency control), not
+command submission at all:
+```
+[   15.418109] xe 0000:00:04.0: [drm] Tile0: GT0: GuC PC start taking longer than normal [freq = 0MHz (req = 0MHz), perf_limit_reasons = 0x00000000]
+[   16.418126] xe 0000:00:04.0: [drm] *ERROR* Tile0: GT0: GuC PC Start failed: Dynamic GT frequency control and GT sleep states are now disabled.
+[   16.418219] xe 0000:00:04.0: probe with driver xe failed with error -5
+```
+This is real, new, unresearched territory (GuC PC's own mmio mailbox
+handshake/register interface for GT frequency requests) - not a command-
+submission problem, and not attempted in this commit.
