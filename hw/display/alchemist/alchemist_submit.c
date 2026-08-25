@@ -25,10 +25,10 @@
  * looked up per-context from the engine_class REGISTER_CONTEXT reported
  * (xe_ring_ops.c's per-class ring_ops table):
  *
- * - XE_ENGINE_CLASS_RENDER (also XE_ENGINE_CLASS_COMPUTE, not yet wired
- *   up - no context has needed it yet): emit_job_gen12_render_compute(),
- *   a 9-dword QW PIPE_CONTROL breadcrumb write via emit_pipe_imm_ggtt(),
- *   then emit_user_interrupt().
+ * - XE_ENGINE_CLASS_RENDER and XE_ENGINE_CLASS_COMPUTE (the latter
+ *   additionally routed through alchemist_gpgpu.c first - see below):
+ *   emit_job_gen12_render_compute(), a 9-dword QW PIPE_CONTROL
+ *   breadcrumb write via emit_pipe_imm_ggtt(), then emit_user_interrupt().
  * - XE_ENGINE_CLASS_COPY: __emit_job_gen12_simple(), a different,
  *   shorter 8-dword MI_FLUSH_DW breadcrumb, no PIPE_CONTROL at all.
  *
@@ -48,6 +48,13 @@
  * Any other engine class is left alone (silently ignored, not guessed
  * at) until real evidence - an actual stall - shows it's needed, the
  * same discipline used throughout this project.
+ *
+ * XE_ENGINE_CLASS_COMPUTE additionally gets a real forward walk of its
+ * ring/indirect-batch content (alchemist_gpgpu_process_ring(), in
+ * alchemist_gpgpu.c) before the epilogue search below runs - unlike
+ * render/copy, a compute dispatch's actual work (COMPUTE_WALKER) has to
+ * be found and executed, not just detected as "present", for the
+ * dispatch to mean anything.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -164,7 +171,8 @@ static void submit_run_context(AlchemistState *s, uint32_t guc_id,
                                 bool is_mode_set)
 {
     uint64_t lrc_addr, regs_off, ring_addr;
-    uint32_t tail_reg, ctl_reg, ring_start, ring_size, tail_off;
+    uint32_t tail_reg, head_reg, ctl_reg, ring_start, ring_size;
+    uint32_t tail_off, head_off;
     uint32_t i, last_off = 0;
     bool found_anchor = false;
     uint64_t seqno_addr;
@@ -178,10 +186,12 @@ static void submit_run_context(AlchemistState *s, uint32_t guc_id,
     lrc_addr = s->ctx[guc_id].lrc_ggtt_addr;
     regs_off = lrc_addr + LRC_PPHWSP_SIZE;
 
-    /* Only the tail is needed - the fixed completion epilogue this
-     * function looks for always sits immediately before it, regardless
-     * of where head currently is. */
+    /* head is only needed for the compute case's forward command-stream
+     * walk (alchemist_gpgpu.c) - the fixed completion epilogue every
+     * other class looks for always sits immediately before tail,
+     * regardless of where head currently is. */
     if (!alchemist_ggtt_read(s, regs_off + CTX_RING_TAIL_OFF, &tail_reg, 4) ||
+        !alchemist_ggtt_read(s, regs_off + CTX_RING_HEAD_OFF, &head_reg, 4) ||
         !alchemist_ggtt_read(s, regs_off + CTX_RING_START_OFF, &ring_start, 4) ||
         !alchemist_ggtt_read(s, regs_off + CTX_RING_CTL_OFF, &ctl_reg, 4)) {
         return;
@@ -189,12 +199,25 @@ static void submit_run_context(AlchemistState *s, uint32_t guc_id,
     ring_addr = ring_start; /* CTX_RING_START is a plain 32-bit GGTT address */
 
     tail_off = tail_reg & RING_TAIL_ADDR_MASK;
+    head_off = head_reg & RING_HEAD_ADDR_MASK;
     /* RING_CTL_SIZE(size) = size - PAGE_SIZE, RING_VALID = bit 0 - see
      * regs/xe_engine_regs.h and alchemist_guc.c's DMA_CTRL handling for
      * the same masked-register convention. */
     ring_size = (ctl_reg & ~RING_CTL_VALID) + LRC_PPHWSP_SIZE;
     if (ring_size < MI_EPILOGUE_DWORDS * 4) {
         return;
+    }
+
+    /* Compute dispatch content (PIPELINE_SELECT/STATE_BASE_ADDRESS/
+     * CFE_STATE/COMPUTE_WALKER, reached via MI_BATCH_BUFFER_START) must
+     * be processed - and any EU-thread memory write it causes performed
+     * - before completion is signaled below, matching real causality.
+     * See alchemist_gpgpu.c's file comment for why this can't be folded
+     * into the epilogue search: real compute command content never
+     * appears directly in the ring. */
+    if (s->ctx[guc_id].engine_class == XE_ENGINE_CLASS_COMPUTE) {
+        alchemist_gpgpu_process_ring(s, guc_id, ring_addr, ring_size,
+                                      head_off, tail_off);
     }
 
     /* Both epilogue shapes end in the same MI_ARB_CHECK - find it once,
@@ -224,6 +247,17 @@ static void submit_run_context(AlchemistState *s, uint32_t guc_id,
             return;
         }
         raise_irq = alchemist_irq_raise_rcs0;
+        break;
+    case XE_ENGINE_CLASS_COMPUTE:
+        /* Same ring epilogue shape as render - xe_ring_ops.c:
+         * XE_ENGINE_CLASS_COMPUTE and _RENDER both resolve to
+         * emit_job_gen12_render_compute(); only the interrupt identity
+         * differs (INTR_CCS0, not INTR_RCS0). */
+        if (!submit_epilogue_render_compute(s, ring_addr, ring_size, last_off,
+                                             &seqno_addr, &seqno)) {
+            return;
+        }
+        raise_irq = alchemist_irq_raise_ccs0;
         break;
     case XE_ENGINE_CLASS_COPY:
         if (!submit_epilogue_simple(s, ring_addr, ring_size, last_off,

@@ -223,6 +223,15 @@
 #define   XE_ENGINE_CLASS_RENDER             0u
 #define   GT_MI_USER_INTERRUPT               (1u << 0)
 
+/* CCS0 (compute engine) completion interrupt - same bank-0 GT_INTR_DW
+ * cascade, INTR_CCS(x) = REG_BIT(4+x) - regs/xe_irq_regs.h. Compute
+ * dispatches use the exact same ring_ops/epilogue as render
+ * (xe_ring_ops.c: XE_ENGINE_CLASS_COMPUTE and _RENDER both resolve to
+ * emit_job_gen12_render_compute()) - only the interrupt identity
+ * differs. */
+#define   INTR_CCS0                          (1u << 4)
+#define   XE_ENGINE_CLASS_COMPUTE            5u
+
 /*
  * GuC context registration/scheduling actions - abi/guc_actions_abi.h.
  * Payloads transcribed from xe_guc_submit.c (__register_exec_queue(),
@@ -396,5 +405,108 @@
 #define EU_ARF_NULL    0u
 
 #define EU_SFID_MESSAGE_GATEWAY 0x3u
+#define EU_SFID_UGM             0xFu
+
+/*
+ * LSC (Load/Store/Control-message) descriptor bit layout - Mesa's
+ * gen_encoding.cpp gen_lsc_desc_decode()/gen_helpers.h, hardware-verified
+ * against a real ocloc-compiled `buf[0] = 42` kernel's send.ugm bytes
+ * (desc == 0x020E8584, see alchemist_gpgpu.c and docs/alchemist-bringup.md).
+ * Only the fields needed to recognize a flat/stateless 64-bit-address,
+ * 32-bit-scalar store (this phase's whole scope - anything else is left
+ * alone, not guessed at) are named here.
+ */
+#define LSC_DESC_OP_MASK             0x3Fu        /* bits [5:0] */
+#define   LSC_OP_STORE               0x4u
+#define LSC_DESC_ADDR_SIZE_SHIFT     7u            /* bits [8:7] */
+#define LSC_DESC_ADDR_SIZE_MASK      0x3u
+#define   LSC_ADDR_SIZE_A64          0x3u
+#define LSC_DESC_DATA_SIZE_SHIFT     9u            /* bits [11:9] */
+#define LSC_DESC_DATA_SIZE_MASK      0x7u
+#define   LSC_DATA_SIZE_D32          0x2u
+#define LSC_DESC_VECT_SIZE_SHIFT     12u           /* bits [14:12] */
+#define LSC_DESC_VECT_SIZE_MASK      0x7u
+#define   LSC_VECT_SIZE_V1           0x0u
+#define LSC_DESC_MSG_LENGTH_SHIFT    25u           /* bits [28:25], src0/address GRFs */
+#define LSC_DESC_MSG_LENGTH_MASK     0xFu
+#define LSC_DESC_ADDR_TYPE_SHIFT     29u           /* bits [30:29] */
+#define LSC_DESC_ADDR_TYPE_MASK      0x3u
+#define   LSC_ADDR_SURFTYPE_FLAT     0x0u
+
+/*
+ * GPGPU/compute command stream - gen125.xml, cross-confirmed against
+ * real ocloc-compiled command sequences (see alchemist_gpgpu.c). Command
+ * type field, bits[31:29] of any instruction/command header dword.
+ */
+#define GPGPU_CMD_TYPE_MI       0u
+#define GPGPU_CMD_TYPE_GFXPIPE  3u
+
+/* PIPELINE_SELECT - gen125.xml: Type=3,SubType=1,Opcode=1,SubOpcode=4
+ * (bits[31:16]); always exactly 1 dword, no length field at all. */
+#define PIPELINE_SELECT_HDR_MASK   0xFFFF0000u
+#define PIPELINE_SELECT_HDR_VALUE  0x69040000u
+
+/* STATE_BASE_ADDRESS - gen125.xml: Type=3,SubType=0,Opcode=1,SubOpcode=1
+ * (bits[31:16]). Instruction Base Address is a 2-dword address field
+ * (dwords 10-11 relative to the command start, bits[63:12]); bit 0 of
+ * dword 10 is its own "Modify Enable" flag. */
+#define STATE_BASE_ADDRESS_HDR_MASK        0xFFFF0000u
+#define STATE_BASE_ADDRESS_HDR_VALUE       0x61010000u
+#define STATE_BASE_ADDRESS_INSTR_BASE_DW   10u
+#define   STATE_BASE_ADDRESS_INSTR_BASE_MODIFY_EN (1u << 0)
+
+/* CFE_STATE / COMPUTE_WALKER - gen125.xml: Type=3,Pipeline=2(GPGPU),
+ * ComputeCmdOpcode=2, CFE-SubOpcode at bits[23:18] (0=CFE_STATE,
+ * 2=COMPUTE_WALKER) - bits[31:18] together identify which one; bits
+ * [17:16] (SubOpcode Variant) are deliberately excluded from the match
+ * mask since they're real, independently-varying fields, not part of
+ * the command's identity. */
+#define GPGPU_CMD_HDR_MASK       0xFFFC0000u
+#define CFE_STATE_HDR_VALUE      0x72000000u
+#define COMPUTE_WALKER_HDR_VALUE 0x72080000u
+
+/* COMPUTE_WALKER - gen125.xml COMPUTE_WALKER_BODY (39 dwords total,
+ * dwords 0-38; the body struct's own field numbering starts at body-
+ * relative dword 1 = absolute dword 2 - all indices below are already
+ * absolute). Only the fields a minimal 1x1x1/1-thread dispatch with an
+ * inline-only cross-thread payload needs are named here. */
+#define COMPUTE_WALKER_DWORDS         39u
+#define CW_DW_INDIRECT_DATA_LENGTH    2u
+#define CW_DW_INDIRECT_DATA_START     3u
+#define CW_DW_EXEC_CONTROL            4u
+#define   CW_EMIT_INLINE_PARAMETER    (1u << 25)
+#define CW_DW_GROUP_DIM_X             7u
+#define CW_DW_GROUP_DIM_Y             8u
+#define CW_DW_GROUP_DIM_Z             9u
+#define CW_DW_IDD_KERNEL_START        18u  /* bits[31:6] */
+#define   CW_KERNEL_START_MASK        0xFFFFFFC0u
+#define CW_DW_IDD_THREADS_IN_GROUP    23u  /* bits[9:0] */
+#define   CW_THREADS_IN_GROUP_MASK    0x3FFu
+#define CW_DW_INLINE_DATA_START       31u  /* 8 dwords (32 bytes), through 38 */
+
+/* MI_BATCH_BUFFER_START - xe_mi_commands.h __MI_INSTR(0x31) - matched by
+ * opcode only (bits[31:23]); low bits (ppgtt flag, length, ...) vary
+ * legitimately per use and are decoded separately. */
+#define MI_OPCODE_HDR_MASK              0xFF800000u
+#define MI_BATCH_BUFFER_START_HDR_VALUE 0x18800000u
+#define MI_BATCH_BUFFER_START_PPGTT_FLAG (1u << 8)
+#define MI_BATCH_BUFFER_END_HDR_VALUE   0x05000000u
+
+/* Pure malformed-input guards for alchemist_gpgpu.c's forward walkers -
+ * not a real hardware limit, just a bound on how far we'll walk looking
+ * for MI_BATCH_BUFFER_START (in the ring) or COMPUTE_WALKER/
+ * MI_BATCH_BUFFER_END (in the indirect batch) before giving up on
+ * content that doesn't look like a real, well-formed command stream. A
+ * real minimal OpenCL dispatch batch is on the order of tens of dwords
+ * (gen125.xml command lengths above), so a few hundred is generous. */
+#define GPGPU_RING_WALK_GUARD  256u
+#define GPGPU_BATCH_WALK_GUARD 512u
+
+/* Bound on how many EU instructions alchemist_gpgpu.c will fetch from a
+ * dispatched kernel before giving up looking for a send/EOT - a real
+ * trivial OpenCL kernel (mov + send{EOT}, per Phase 12's research) is 2
+ * instructions; generous enough for a real but still-simple kernel
+ * without buffering an unbounded amount of guest-controlled "code". */
+#define GPGPU_MAX_KERNEL_INSTRS 64u
 
 #endif

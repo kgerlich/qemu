@@ -1162,3 +1162,145 @@ instruction program (`mov` then `send{EOT}`) run through
 `alchemist_eu_run()`, correctly executing both instructions and
 stopping on the send with `EOT` set. Full probe success confirmed
 unaffected by this change.
+
+## Phase 13: GPGPU/compute dispatch
+
+The compute milestone: recognizing real `PIPELINE_SELECT`/
+`STATE_BASE_ADDRESS`/`CFE_STATE`/`COMPUTE_WALKER` command-stream content,
+dispatching a simulated EU thread through it (Phase 12's interpreter),
+and honoring the real memory write a compiled OpenCL kernel's terminal
+`send` performs - the first real, end-to-end exercise of Phase 10's
+PPGTT walker and Phase 12's EU interpreter together. New
+`hw/display/alchemist/alchemist_gpgpu.c`.
+
+### Research: two passes, both landing exact, hardware-verified answers
+
+**Command-stream/dispatch shape** (background research, cross-referencing
+`xe_ring_ops.c`, Intel compute-runtime's Xe-HPG command encoder, and
+Mesa's `gen125.xml`) confirmed several load-bearing simplifications:
+- Compute completion reuses **exactly** the render-class ring epilogue
+  (`emit_job_gen12_render_compute()` in `xe_ring_ops.c` serves both
+  `XE_ENGINE_CLASS_RENDER` and `_COMPUTE`) - only the interrupt identity
+  differs (`INTR_CCS0`, bank-0 bit 4, vs `INTR_RCS0`'s bit 0). No new
+  completion-detection code needed at all, just a new `switch` case in
+  `alchemist_submit.c`'s `submit_run_context()`.
+- Real compute command content never appears directly in the ring - it's
+  always reached through `MI_BATCH_BUFFER_START` jumping into a separate,
+  PPGTT- or GGTT-addressed indirect batch buffer (selected by the
+  instruction's own ppgtt-flag bit). This requires a genuine forward
+  command-stream walker, not just the backward-from-tail epilogue search
+  render/copy already use.
+- On Xe-HPG, **only the first 32 bytes of cross-thread payload**
+  (`COMPUTE_WALKER`'s "Inline Data") are DMA'd into GRF `r1` by
+  fixed-function hardware - everything beyond that is fetched by the
+  kernel's own compiled prolog via explicit `send` messages, not by
+  hardware. For a minimal `buf[0]=42`-style kernel (one 8-byte pointer
+  argument), the whole payload fits inline - no indirect payload fetch
+  needed for the argument itself.
+- Real intermediate command content between `MI_BATCH_BUFFER_START` and
+  the commands that matter here is **not fixed-size** (e.g. DG2's
+  render-cache-flush workaround inserts a variable number of extra
+  dwords) - ruling out a fixed-offset approach in favor of a real,
+  generic instruction-length decoder (`gpgpu_instr_length()`,
+  `alchemist_gpgpu.c`): the documented bias-2 `length field = dwords - 2`
+  convention, with the small set of fixed-single-dword MI opcodes and
+  `PIPELINE_SELECT` (gen125.xml: `bias="1" length="1"`, no runtime length
+  field at all) as the only special cases.
+
+**LSC/UGM store message decode** (a second, targeted research pass):
+compiled the exact `buf[0] = 42` kernel with `ocloc compile -device dg2`
+and cross-verified the disassembly two independent ways (`ocloc disasm`
+and `iga64 -d` on the raw extracted `.text.k` ELF bytes), then confirmed
+the LSC descriptor bit layout against Mesa's `gen_encoding.cpp`/
+`gen_helpers.h` (current upstream). The real kernel:
+```
+mov (2|M0)  r3.0<1>:f  r1.0<1;1,0>:f          (compacted - address arg, r1 -> r3)
+mov (1|M0)  r4.0<1>:d  42:w                    61 00 00 80 60 45 05 04 00 00 00 00 2a 00 2a 00
+send.ugm (1|M0) null r3 r4:1 0x0 0x020E8584    31 90 00 80 00 00 00 00 0c 03 08 fb 0c 04 a0 03
+send.gtwy (1|M0) null r127 null:0 0x0 0x02000010 {EOT}
+```
+Decoding `desc = 0x020E8584` against the interpreter's own
+`send_desc`-reassembly formula (`alchemist_eu.c`) reproduces it exactly,
+independently confirming that formula is still correct for this new
+instruction. Field-by-field (`gen_lsc_desc_decode`): `op[5:0]=4`
+(`LSC_OP_STORE`), `addr_type[30:29]=0` (`FLAT`/stateless - a plain GPU
+VA, no binding table), `addr_size[8:7]=3` (`A64` - 64-bit address),
+`data_size[11:9]=2` (`D32`), `vect_size[14:12]=0` (`V1`, scalar). The
+address payload occupies `msg_length[28:25]=1` GRF starting at `send`'s
+own `payload_reg` (`src0`, here `r3`); the data payload is the *next*
+GRF, `payload_reg + msg_length` (here `r3+1=r4`) - a real, address-size-
+dependent formula, not a hardcoded `+1` that happens to work for this
+one case. `alchemist_regs.h`'s new `LSC_*` constants and
+`alchemist_gpgpu.c`'s `gpgpu_handle_send()` implement exactly this.
+
+### A real bug found and fixed: narrow immediates into wider destinations
+
+Building the self-test below (see next section) surfaced a genuine,
+previously-untested gap in Phase 12's `alchemist_eu.c`: the real
+`mov r4.0<1>:d 42:w` instruction encodes its 16-bit immediate duplicated
+across the full 32-bit `imm32` field (`0x002A002A`, a hardware encoding
+convenience), but `eu_exec_mov`/`eu_exec_add` used that raw 32-bit value
+unmodified regardless of `src0_type` - so the destination would have
+received `0x002A002A`, not `42`. Neither of Phase 12's own worked
+examples exercised a narrower-than-destination immediate, so this went
+undetected until Phase 13's real kernel needed it. Fixed by narrowing to
+the immediate's real type width and sign/zero-extending (`eu_imm_value()`,
+mirroring `eu_read_operand()`'s existing identical convention for
+register reads) before use - a real, hardware-evidence-driven
+correction to already-committed code, not new-phase scope creep: any
+future kernel using a narrow immediate into a wider destination would
+otherwise have silently corrupted data.
+
+### Deliberate scope limits (real, not oversights)
+
+- **Exactly one 1x1x1 thread-group, 1-thread `COMPUTE_WALKER` per batch**
+  is dispatched - the real minimal OpenCL dispatch shape. Anything else
+  (multiple groups/threads, an indirect cross-thread payload) is left
+  alone, not guessed at, the same discipline `alchemist_submit.c` already
+  uses for engine classes/epilogue shapes it doesn't recognize -
+  verified directly (see below).
+- **Only the exact LSC store shape the real kernel uses** (`STORE`/
+  `FLAT`/`A64`/`D32`/`V1`) is honored in `gpgpu_handle_send()`. Other LSC
+  ops (loads, atomics, vector/2D-block messages) use different sub-field
+  layouts within the same 32-bit descriptor - deferred until real
+  evidence (an actual kernel needing them) shows up, per this project's
+  standing discipline.
+- `alchemist_ppgtt_write()` (declared since Phase 10, unused until now)
+  needed no changes - this store is exactly the "first real consumer"
+  Phase 10's docs flagged it as waiting for.
+
+### Evidence
+
+Verified with a temporary self-test (added to `pci_alchemist_realize()`,
+removed before this commit - same convention as every prior phase's
+selftest): a synthetic ring + indirect batch buffer (`PIPELINE_SELECT`/
+`STATE_BASE_ADDRESS`/`CFE_STATE`/`COMPUTE_WALKER`, GGTT-resident) plus a
+synthetic 2-level PPGTT tree (root -> a 1GB-huge-page leaf, the minimal
+tree that exercises a real `XE_PDPE_PS_1G` early return) built directly
+in GGTT-mapped scratch VRAM, using context slot 63 (unused by the real
+guest boot sequence - same convention as Phase 10's PPGTT selftest). The
+dispatched kernel is the **exact real `ocloc`-compiled instruction bytes**
+from the research above (plus two hand-constructed-but-real-encoding
+`mov`s to copy the inline-payload pointer from `r1` to `r3`, since the
+real kernel's equivalent copy is a *compacted* instruction this project
+deliberately doesn't decode - see Phase 12's file comment), run through
+the real `alchemist_gpgpu_process_ring()`:
+```
+ALCHEMIST-TRACE: gpgpu selftest store ok=1 val=42 (want 42)
+ALCHEMIST-TRACE: gpgpu selftest multi-group rejected ok=1 val=0 (want 0)
+```
+Both passed on the first attempt after the immediate-width fix above.
+The first case is the real milestone end to end: ring -> indirect batch
+-> `STATE_BASE_ADDRESS` capture -> `COMPUTE_WALKER` decode -> EU thread
+dispatch -> real compiled kernel execution -> LSC store decode -> PPGTT
+write, landing the real value `42` at the target GPU VA. The second
+confirms the "exactly one thread" scope limit is a real rejection, not
+untested: a `COMPUTE_WALKER` with `GroupDimX=2` causes no memory write at
+all, exactly as designed.
+
+Full guest boot re-run afterward to confirm no regression:
+`Kernel driver in use: xe`, `/dev/dri/card0`/`renderD128` both present,
+probe unaffected. The pre-existing `xe_display_pm_shutdown` NULL-deref
+on poweroff (documented above, Phase 9-era finding - display isn't
+implemented until Phase 15) still occurs, unrelated to this phase's
+changes and after all evidence had already been captured.

@@ -15,10 +15,11 @@
  *           on real hardware so one status register can serve many
  *           possible sources without a dedicated register per source.
  *
- * We only ever raise three sources, all bank 0 - GuC2Host, RCS0 (render
- * engine completion) and BCS0 (blitter/copy engine completion), both
- * from alchemist_submit.c - since no other engines are modeled yet, but
- * the mechanism is implemented for real: the driver walks this exact
+ * We only ever raise four sources, all bank 0 - GuC2Host, RCS0 (render
+ * engine completion), BCS0 (blitter/copy engine completion), and CCS0
+ * (compute engine completion), the last three from alchemist_submit.c/
+ * alchemist_gpgpu.c - since no other engines are modeled yet, but the
+ * mechanism is implemented for real: the driver walks this exact
  * cascade
  * regardless of how many sources exist behind it, so a shortcut here
  * (e.g. firing the MSI without the identity chain backing it) would
@@ -88,6 +89,11 @@ void alchemist_irq_raise_bcs0(AlchemistState *s)
     alchemist_irq_raise_gt0(s, INTR_BCS0);
 }
 
+void alchemist_irq_raise_ccs0(AlchemistState *s)
+{
+    alchemist_irq_raise_gt0(s, INTR_CCS0);
+}
+
 /* GT_INTR_DW/GFX_MSTR_IRQ/DG1_MSTR_TILE_INTR: write-1-to-clear status
  * registers, handled here instead of via the generic buffer store - see
  * the file comment above for why. Called from alchemist_mmio_write()
@@ -133,6 +139,13 @@ void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size)
             } else if (bank == 0 && selector == INTR_BCS0) {
                 identity = INTR_DATA_VALID |
                            (XE_ENGINE_CLASS_COPY << INTR_ENGINE_CLASS_SHIFT) |
+                           (0 << INTR_ENGINE_INSTANCE_SHIFT) |
+                           GT_MI_USER_INTERRUPT;
+                alchemist_mmio_store32(s, ALCHEMIST_REG_INTR_IDENTITY_REG(bank),
+                                        identity);
+            } else if (bank == 0 && selector == INTR_CCS0) {
+                identity = INTR_DATA_VALID |
+                           (XE_ENGINE_CLASS_COMPUTE << INTR_ENGINE_CLASS_SHIFT) |
                            (0 << INTR_ENGINE_INSTANCE_SHIFT) |
                            GT_MI_USER_INTERRUPT;
                 alchemist_mmio_store32(s, ALCHEMIST_REG_INTR_IDENTITY_REG(bank),

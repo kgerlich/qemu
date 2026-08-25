@@ -165,6 +165,7 @@ void alchemist_irq_status_write(AlchemistState *s, hwaddr addr, uint64_t val);
 void alchemist_irq_raise_guc2host(AlchemistState *s);
 void alchemist_irq_raise_rcs0(AlchemistState *s);
 void alchemist_irq_raise_bcs0(AlchemistState *s);
+void alchemist_irq_raise_ccs0(AlchemistState *s);
 void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size);
 
 /*
@@ -189,6 +190,20 @@ void alchemist_ctb_send_sched_context_mode_done(AlchemistState *s,
  */
 void alchemist_submit_handle_action(AlchemistState *s, uint32_t action,
                                      const uint32_t *payload, uint32_t n);
+
+/*
+ * GPGPU/compute dispatch - see alchemist_gpgpu.c. Called from
+ * alchemist_submit.c's submit_run_context() for XE_ENGINE_CLASS_COMPUTE
+ * contexts, before its existing ring-epilogue/completion-signaling logic
+ * runs (any EU-thread memory write from a dispatched COMPUTE_WALKER must
+ * happen before completion is signaled, matching real causality). `head`
+ * and `tail` are ring byte offsets (already masked with
+ * RING_HEAD_ADDR_MASK/RING_TAIL_ADDR_MASK), `ring_size` the ring's size
+ * in bytes - the same conventions submit_run_context() already uses.
+ */
+void alchemist_gpgpu_process_ring(AlchemistState *s, uint32_t guc_id,
+                                   uint64_t ring_addr, uint32_t ring_size,
+                                   uint32_t head, uint32_t tail);
 
 /*
  * GuC PC (power/frequency control) - see alchemist_pc.c. Called from

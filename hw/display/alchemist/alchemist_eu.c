@@ -242,6 +242,35 @@ static bool eu_write_operand(AlchemistEuState *regs, bool is_arf,
     return true;
 }
 
+/*
+ * The raw 32-bit immediate field is always full-width in the instruction
+ * encoding, but its *meaningful* value is only src0_type's own width -
+ * e.g. a real ocloc-compiled `mov r4.0<1>:d 42:w` encodes imm32 as
+ * 0x002A002A (the 16-bit value duplicated into both halves, a hardware
+ * encoding convenience), not literally 42 as a 32-bit value. Narrowing
+ * to src0_type's width and then sign/zero-extending (matching
+ * eu_read_operand's identical W-sign-extension convention for register
+ * reads) is what recovers the real 42 - confirmed against this exact
+ * real instruction (see docs/alchemist-bringup.md, Phase 13). Returns
+ * false for an unrecognized type, same contract as eu_read_operand.
+ */
+static bool eu_imm_value(uint32_t imm32, uint32_t type, uint32_t *out)
+{
+    uint32_t width = eu_type_width(type);
+    uint32_t v;
+
+    if (width == 0) {
+        return false;
+    }
+
+    v = (width == 4) ? imm32 : (imm32 & ((1u << (width * 8)) - 1));
+    if (type == EU_TYPE_W && (v & 0x8000)) {
+        v |= 0xFFFF0000u; /* sign-extend */
+    }
+    *out = v;
+    return true;
+}
+
 static AlchemistEuStatus eu_exec_mov(AlchemistEuState *regs,
                                       const EuDecoded *d)
 {
@@ -253,8 +282,13 @@ static AlchemistEuStatus eu_exec_mov(AlchemistEuState *regs,
     }
 
     if (d->src0_is_imm) {
+        uint32_t v;
+
+        if (!eu_imm_value(d->imm32, d->src0_type, &v)) {
+            return ALCHEMIST_EU_UNSUPPORTED;
+        }
         for (i = 0; i < d->exec_size; i++) {
-            vals[i] = d->imm32;
+            vals[i] = v;
         }
     } else if (!eu_read_operand(regs, d->src0_is_arf, d->src0_regnum,
                                  d->src0_subregnum, d->src0_type,
@@ -284,8 +318,13 @@ static AlchemistEuStatus eu_exec_add(AlchemistEuState *regs,
     }
 
     if (d->src0_is_imm) {
+        uint32_t v;
+
+        if (!eu_imm_value(d->imm32, d->src0_type, &v)) {
+            return ALCHEMIST_EU_UNSUPPORTED;
+        }
         for (i = 0; i < d->exec_size; i++) {
-            a[i] = d->imm32;
+            a[i] = v;
         }
     } else if (!eu_read_operand(regs, d->src0_is_arf, d->src0_regnum,
                                  d->src0_subregnum, d->src0_type,
@@ -294,8 +333,13 @@ static AlchemistEuStatus eu_exec_add(AlchemistEuState *regs,
     }
 
     if (d->src1_is_imm) {
+        uint32_t v;
+
+        if (!eu_imm_value(d->imm32, d->src1_type, &v)) {
+            return ALCHEMIST_EU_UNSUPPORTED;
+        }
         for (i = 0; i < d->exec_size; i++) {
-            b[i] = d->imm32;
+            b[i] = v;
         }
     } else if (!eu_read_operand(regs, d->src1_is_arf, d->src1_regnum,
                                  d->src1_subregnum, d->src1_type,
