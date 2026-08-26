@@ -1493,83 +1493,78 @@ it - traced all the way down to the root: `guc_id=8`'s own
 root page table has **zero non-zero entries at all** - a completely
 unbound PPGTT, not a missing leaf or a wrong-level miss.
 
-### Investigation: tracking down the unbound root (inconclusive, no fix yet)
+### Root cause found and fixed: page-table node content is VRAM, not GGTT
 
-A dedicated follow-up session traced this as far as static analysis and
-live memory inspection allow, ruling out several real hypotheses with
-hard evidence rather than assumption - each is recorded here so the
-next attempt doesn't re-tread the same ground:
+A dedicated follow-up session root-caused this with live kretprobe/kprobe
+instrumentation of the real, unmodified guest kernel via ftrace
+(`/sys/kernel/debug/tracing/kprobe_events`) - `CONFIG_DYNAMIC_DEBUG`
+having no usable callsites for `xe_vm.c` (confirmed in the prior
+investigation above) ruled out `vm_dbg()`, but the driver's *functions*
+are still live, unmodified kernel code that kprobes/kretprobes can attach
+to with zero rebuild - a new technique for this project's toolkit.
 
-- **Not a GPU-side (batch-executed) page-table update we're failing to
-  execute.** `xe_migrate_update_pgtables()` (`xe_migrate.c`) always
-  tries `xe_migrate_update_pgtables_cpu()` first, which only returns
-  `-ETIME` (triggering the GPU-batch fallback,
-  `__xe_migrate_update_pgtables()`) under `XE_TEST_ONLY(test &&
-  test->force_gpu)` - a kunit-test-only code path, dead in a real,
-  non-test boot. Production binds are unconditionally CPU-side direct
-  writes into `update->pt_bo->vmap`; there is no "we don't execute the
-  real bind batch" gap to fix here.
-- **Not a stale/single read.** `guc_id=8`'s `CTX_PDP0` was re-read (and
-  its root re-scanned, all 512 entries) at the exact moment its one and
-  only real job's `SCHED_CONTEXT` arrived - not cached from an earlier
-  point.
-- **Not specific to the compute exec queue.** `guc_id=0` (the migrate
-  queue, now working correctly per the fix above) has its *own* real,
-  distinct `CTX_PDP0` (`root=0x3fd6f000`, one page below `guc_id=8`'s
-  `0x3fd6e000`) - and it is **also** completely unbound (zero non-zero
-  entries). Whatever's going on isn't unique to the new compute
-  registration.
-- **Not every registered context lacks a VM** - only the two that matter
-  do, and differently: the six Phase 8/13-era probe-time WA-job contexts
-  (`guc_id` 1,2,3,4,5,6) all have `CTX_PDP0 == 0` (real and expected -
-  those are `vm=NULL` kernel exec queues, confirmed via
-  `xe_gt_record_default_lrcs()`'s `xe_exec_queue_create(xe, NULL, ...)`
-  call). Only `guc_id` 0 and 8 have a *real, non-zero, page-aligned*
-  root address that simply has nothing written into it - a materially
-  different, more specific problem than "no VM at all".
-- **A broad GGTT scan for a populated PPGTT-shaped page elsewhere
-  produced only false positives.** Scanning `0x300000..0x800000` for
-  pages with multiple 8-byte entries whose low 12 bits are a subset of
-  the real valid PTE/PDE flag bits (`PRESENT|RW|PDE_64K|PS|DM`) surfaced
-  a few candidates; the most promising (`0x400000`, 9 matching entries)
-  turned out on raw inspection to be real GPU command-stream content
-  (a repeating `MI`/`GFXPIPE`-header pattern, not a page table) that
-  happened to satisfy the filter by coincidence - a reminder that this
-  kind of structural pattern-matching against real command data is too
-  weak a signal to trust without also checking the raw content, which
-  is exactly what caught it here.
-- **Dynamic debug isn't available as a shortcut.** `xe_vm.c`'s own
-  `vm_dbg()` calls (real, upstream, print the exact VA/range of every
-  MAP/UNMAP - `xe_vm.c:2342` etc.) would have answered this directly,
-  but `/sys/kernel/debug/dynamic_debug/control` has zero entries for
-  `xe_vm.c` in the current guest kernel (`7.0.0-30-generic`) - either
-  `CONFIG_DYNAMIC_DEBUG` isn't enabled for this build or the callsites
-  were compiled out; `dyndbg=` on the kernel command line had no effect
-  either. Getting real, direct evidence of which VM the guest kernel
-  actually bound the kernel/buffer content into would need either a
-  custom-rebuilt `xe.ko` with an unconditional `printk` added (not
-  attempted - real risk of ABI/toolchain mismatch against the stock
-  Ubuntu kernel, a substantial undertaking of its own), or finding
-  another existing observability path in the stock kernel that wasn't
-  found this session.
+A kretprobe on `xe_vm_pdp4_descriptor()` (the exact function that
+produces a context's `CTX_PDP0` value) captured its real return value
+live, during the guest's own bind - and it matched, byte for byte, the
+`CTX_PDP0` this device model had already been reading for `guc_id=8` and
+`guc_id=0`. The root address itself was never wrong. A companion kprobe
+on `xe_vm_populate_pgtable()` (the real CPU-side bind writer identified
+in the previous investigation) confirmed it genuinely executes - 17 real
+calls with real qword offsets during the test - so the bind was
+happening; only *our* read of its result was empty.
 
-**Where this leaves it**: the completion-signaling path for real compute
-jobs works correctly (verified directly - `alchemist_submit.c` reaches
-and logs "completion signaled" for `guc_id=8`'s one real job, seqno and
-address both sane), so the *symptom* users would see isn't a
-driver-level hang or reset loop, it's a silent one: `clFinish()`
-completes long before it should be waiting, `alchemist_gpgpu.c`'s
-walker gives up cleanly the moment PPGTT translation fails, but the
-kernel/buffer the compiled program actually needs was never fetched or
-executed, and the eventual read-back would be wrong (never reached
-in this session - the guest just sits in `clEnqueueReadBuffer` or a
-later synchronization point without producing more driver activity to
-observe). The real question - which VM the guest kernel bound the
-`buf[0]=42` kernel's containing allocation into, and why that's
-different from what `guc_id=8`'s LRC references - needs either kernel
-instrumentation (a real rebuild, not attempted) or substantially deeper
-reading of NEO's `xe` backend VM-creation/exec-queue-association code
-than this session covered. Flagged honestly as the next concrete
-blocker, not guessed at or worked around; no functional code changes
-were made in this investigation (all temporary tracing added and
-stripped, same convention as every other phase).
+That reframed the question: not "is anything binding this VM" but "why
+does our own read of a confirmed-correct, confirmed-populated address
+come back empty." Reading `xe_pt_create()` (`xe_pt.c`) directly answered
+it: every page-table node's backing `xe_bo` is allocated with
+`XE_BO_FLAG_VRAM_IF_DGFX(tile)` - unconditionally VRAM on a discrete
+card, which DG2 always is. `xelp_pde_encode_bo()` (`xe_vm.c`) then
+encodes each PDE/PTE/CTX_PDP0 value via `xe_bo_addr()`, which for a
+VRAM-backed bo returns `cur.start + offset + vram_region_gpu_offset(...)`
+- a **VRAM-region-relative device physical address**, not a GGTT VA at
+all. This device model's `alchemist_ppgtt.c` was reading every
+page-table node (root, directory, and leaf arrays alike) through
+`alchemist_ggtt_read()` - the same GGTT-mediated path correctly used for
+the LRC itself (a plain, GGTT-resident system-RAM context object). A
+real CTX_PDP0 value that read back as an entirely empty page when
+treated as a GGTT address (every one of its 512 root entries silently
+failing GGTT PTE translation, since nothing had ever mapped that address
+as a GGTT VA) turned out to be a fully populated, coherent page table
+the moment it was read as a plain VRAM offset instead - confirmed with a
+direct A/B test reading the *same* root address both ways: 0/512
+non-zero entries via `alchemist_ggtt_read()`, 512/512 non-zero, real,
+coherent PDE entries (all pointing at the same real level-2 directory,
+matching the driver's own default/scratch-branch population pattern)
+via a raw `s->vram_ptr` read.
+
+This overturns the previous investigation's implicit assumption
+("everything reached through GGTT-style addressing is GGTT-resident") -
+it holds for the LRC and for GGTT-mapped buffer content, but not for
+page-table *node* content on a discrete GPU, which is unconditionally
+VRAM-relative instead.
+
+**The fix** (`alchemist_ppgtt.c`): a new `ppgtt_node_read64()` helper
+reads page-table node entries directly from `s->vram_ptr` (bounds-checked
+against `ALCHEMIST_VRAM_SIZE`, the same discipline the existing
+VRAM-backed leaf-data path already uses), replacing the two
+`alchemist_ggtt_read()` call sites inside `ppgtt_translate_page()`'s
+tree-walk (levels 3→1, and the level-0 leaf lookup). Root *discovery*
+(`CTX_PDP0` via the LRC) is untouched - that lookup is correctly
+GGTT-mediated, since the LRC itself is real GGTT-resident system-RAM
+state.
+
+**Evidence** - a live run with the fix applied and per-level tracing
+(added, then stripped before commit, per convention) shows a full,
+correct 4-level walk resolving a real kernel-fetch GPU VA:
+```
+translate gpu_va=0xffffd556aa740000 root=0x3fd6e000
+  level=3 node=0x3fd6e000 idx=256 entry=0x3fd6601b present=1
+  level=2 node=0x3fd66000 idx=3   entry=0x3fd6501b present=1
+  level=1 node=0x3fd65000 idx=507 entry=0x3e96f01b present=1
+  level=0 node=0x3e96f000 idx=480 entry=0x3fcf0903 present=1 compact=0
+  LEAF phys=0x3fc80000 is_vram=1 page_size=0x1000
+```
+all four levels `present=1`, resolving to real, previously-unreachable
+content - the batch's first dword decoded as `hdr=0x7a000004`, a real
+`GFX_OP_PIPE_CONTROL_LEN6` (matching real compute-runtime flush-emission
+code), correctly length-decoded as 6 dwords.

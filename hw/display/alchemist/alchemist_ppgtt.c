@@ -14,25 +14,43 @@
  * leaves instead of 4K, matching DG2's requirement that VRAM allocations
  * land on 64K boundaries (XE_VRAM_FLAGS_NEED64K).
  *
- * Root address discovery, real completion protocol, and VRAM/system-RAM
- * dispatch are all covered by alchemist_ggtt.c's existing machinery and
- * reused here rather than duplicated:
+ * Root address discovery and the real bind protocol are covered by
+ * alchemist_ggtt.c's existing machinery and reused here rather than
+ * duplicated:
  *
  * - VM_BIND (xe_vm.c/xe_pt.c/xe_migrate.c, confirmed via
  *   xe_migrate_update_pgtables_cpu()) is 100% CPU-side for a fresh,
  *   non-rebind bind - the driver just writes PTE qwords directly into
  *   memory we already expose. No register or GuC-message hook exists to
  *   miss; this file is a pure read-side decode, same as GGTT.
- * - The root page table's GGTT address is a per-context LRC field,
+ * - The root page table's address is a per-context LRC field,
  *   CTX_PDP0_UDW/_LDW (regs/xe_lrc_layout.h), written once at context
  *   init the same way CTX_RING_START etc. already are - resolved here
  *   through the guc_id -> LRC tracking alchemist_submit.c already
- *   maintains for command submission.
- * - Every page-table node (root, directory, or leaf) is itself
- *   GGTT-resident memory (xe_pt_create() allocates a plain 4KB xe_bo per
- *   node), so walking the tree is just repeated alchemist_ggtt_read()
- *   calls - no separate VRAM/system-RAM dispatch logic needed here, GGTT
- *   already resolved that once for the node fetch itself.
+ *   maintains for command submission. The LRC itself is real,
+ *   GGTT-resident system-RAM state (a plain context object, not a
+ *   page-table node), so that lookup goes through
+ *   alchemist_ggtt_read() correctly.
+ *
+ * Page-table NODE content (root, directory, and leaf arrays alike) is a
+ * completely different story, and was the subject of a real, evidence-
+ * driven correction (see docs/alchemist-bringup.md): xe_pt_create()
+ * (xe_pt.c) allocates every page-table node's backing xe_bo with
+ * XE_BO_FLAG_VRAM_IF_DGFX(tile) - unconditionally VRAM for a discrete
+ * card, which DG2 always is - and xelp_pde_encode_bo() (xe_vm.c)
+ * encodes each PDE/PTE/CTX_PDP0 value via xe_bo_addr(), which for a
+ * VRAM-backed bo returns a *VRAM-region-relative device physical
+ * address* (`cur.start + offset + vram_region_gpu_offset(...)`), not a
+ * GGTT-mediated address at all. So unlike the LRC lookup above, node
+ * reads here go straight through `s->vram_ptr` (ppgtt_node_read64()) -
+ * confirmed directly: a real CTX_PDP0 value that read back as an
+ * entirely empty page when treated as a GGTT address (every one of its
+ * 512 root entries silently failing GGTT PTE translation, since nothing
+ * ever mapped that address as a GGTT VA) turned out to be a fully
+ * populated, coherent page table the moment it was read as a plain
+ * VRAM offset instead - all 512 entries alike, pointing at the same
+ * real level-2 directory, matching the driver's own default/scratch-
+ * branch population pattern.
  *
  * PAT/cacheability bits are deliberately not modeled (they don't affect
  * where an address decodes to, only caching behavior, which this project
@@ -72,6 +90,25 @@ static bool ppgtt_get_root(AlchemistState *s, uint32_t guc_id,
 }
 
 /*
+ * A page-table node entry read - node addresses (root/directory/leaf
+ * array base addresses alike) are VRAM-relative device physical
+ * addresses (xe_pt_create()'s XE_BO_FLAG_VRAM_IF_DGFX(tile) +
+ * xelp_pde_encode_bo()'s xe_bo_addr() encoding - see the file comment),
+ * not GGTT VAs - real DG2 hardware's page-table walker reads them
+ * straight out of local memory, no GGTT indirection. Bounds-checked the
+ * same way the leaf-data VRAM path already is.
+ */
+static bool ppgtt_node_read64(AlchemistState *s, uint64_t addr,
+                               uint64_t *val)
+{
+    if (addr + 8 > ALCHEMIST_VRAM_SIZE) {
+        return false;
+    }
+    memcpy(val, s->vram_ptr + addr, 8);
+    return true;
+}
+
+/*
  * Walks the tree for a single gpu_va, returning the target address (a
  * VRAM/BAR2 offset if *is_vram, else a guest system-physical address)
  * and the size of the leaf page it was found in - callers need the real
@@ -92,8 +129,8 @@ static bool ppgtt_translate_page(AlchemistState *s, uint64_t root_addr,
         shift = XE_PPGTT_LEVEL_SHIFT(level);
         index = (gpu_va >> shift) & (XE_PPGTT_PAGE_TABLE_ENTRIES - 1);
 
-        if (!alchemist_ggtt_read(s, node_addr + (uint64_t)index * 8,
-                                  &entry, 8)) {
+        if (!ppgtt_node_read64(s, node_addr + (uint64_t)index * 8,
+                                &entry)) {
             return false;
         }
         if (!(entry & XE_PAGE_PRESENT)) {
@@ -118,7 +155,7 @@ static bool ppgtt_translate_page(AlchemistState *s, uint64_t root_addr,
     shift = compact ? XE_PPGTT_COMPACT_LEAF_SHIFT : XE_PPGTT_LEVEL_SHIFT(0);
     index = (gpu_va >> shift) & (XE_PPGTT_PAGE_TABLE_ENTRIES - 1);
 
-    if (!alchemist_ggtt_read(s, node_addr + (uint64_t)index * 8, &entry, 8)) {
+    if (!ppgtt_node_read64(s, node_addr + (uint64_t)index * 8, &entry)) {
         return false;
     }
     if (!(entry & XE_PAGE_PRESENT)) {
