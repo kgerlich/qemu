@@ -230,17 +230,31 @@ static void gpgpu_dispatch_walker(const GpgpuMem *mem, uint64_t walker_addr,
     gpgpu_handle_send(mem, &regs, &send);
 }
 
-/* Walks a batch buffer starting at `batch_addr` looking for
- * STATE_BASE_ADDRESS (to capture Instruction Base Address) and
+/* Walks a batch buffer starting at `batch_addr` looking for a nested
+ * MI_BATCH_BUFFER_START (real compute-runtime command buffers open with a
+ * setup/flush PIPE_CONTROL, then jump into a second, "real" buffer
+ * carrying PIPELINE_SELECT/STATE_BASE_ADDRESS/CFE_STATE/COMPUTE_WALKER -
+ * hardware-verified live, see docs/alchemist-bringup.md),
+ * STATE_BASE_ADDRESS (to capture Instruction Base Address), and
  * COMPUTE_WALKER (to dispatch). Stops at MI_BATCH_BUFFER_END, after
  * dispatching one COMPUTE_WALKER (this milestone's whole scope), or on
- * anything unrecognized (gpgpu_instr_length() returning 0) - no
- * guessing at malformed/unsupported batch content. */
-static void gpgpu_process_batch(const GpgpuMem *mem, uint64_t batch_addr)
+ * anything unrecognized (gpgpu_instr_length() returning 0) - no guessing
+ * at malformed/unsupported batch content. A nested jump gets its own
+ * independently-read PPGTT-flag bit (not inherited from the outer batch -
+ * real MI_BATCH_BUFFER_START always carries its own) and is followed via
+ * recursion, `instr_base_addr` propagated forward since STATE_BASE_ADDRESS
+ * is context-wide state, not batch-local; `depth` bounds recursion against
+ * malformed/adversarial content chaining jumps indefinitely
+ * (GPGPU_MAX_BATCH_NESTING). */
+static void gpgpu_process_batch(const GpgpuMem *mem, uint64_t batch_addr,
+                                 uint64_t instr_base_addr, uint32_t depth)
 {
     uint64_t pos = batch_addr;
-    uint64_t instr_base_addr = 0;
     uint32_t guard;
+
+    if (depth >= GPGPU_MAX_BATCH_NESTING) {
+        return;
+    }
 
     for (guard = 0; guard < GPGPU_BATCH_WALK_GUARD; guard++) {
         uint32_t hdr, len;
@@ -250,6 +264,23 @@ static void gpgpu_process_batch(const GpgpuMem *mem, uint64_t batch_addr)
         }
 
         if ((hdr & MI_OPCODE_HDR_MASK) == MI_BATCH_BUFFER_END_HDR_VALUE) {
+            return;
+        }
+
+        if ((hdr & MI_OPCODE_HDR_MASK) == MI_BATCH_BUFFER_START_HDR_VALUE) {
+            uint32_t lo, hi;
+
+            if (gpgpu_mem_read(mem, pos + 4, &lo, 4) &&
+                gpgpu_mem_read(mem, pos + 8, &hi, 4)) {
+                GpgpuMem nested = {
+                    mem->s, mem->guc_id,
+                    (hdr & MI_BATCH_BUFFER_START_PPGTT_FLAG) != 0
+                };
+                uint64_t nested_addr = ((uint64_t)hi << 32) | lo;
+
+                gpgpu_process_batch(&nested, nested_addr, instr_base_addr,
+                                     depth + 1);
+            }
             return;
         }
 
@@ -313,7 +344,7 @@ void alchemist_gpgpu_process_ring(AlchemistState *s, uint32_t guc_id,
                 };
                 uint64_t batch_addr = ((uint64_t)hi << 32) | lo;
 
-                gpgpu_process_batch(&mem, batch_addr);
+                gpgpu_process_batch(&mem, batch_addr, 0, 0);
             }
             return;
         }

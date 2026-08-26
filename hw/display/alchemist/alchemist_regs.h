@@ -609,6 +609,16 @@
 #define GPGPU_RING_WALK_GUARD  256u
 #define GPGPU_BATCH_WALK_GUARD 512u
 
+/* Real compute-runtime command buffers nest a second MI_BATCH_BUFFER_START
+ * inside the first (a setup/flush PIPE_CONTROL, then a jump into the
+ * "real" command buffer carrying PIPELINE_SELECT/STATE_BASE_ADDRESS/
+ * CFE_STATE/COMPUTE_WALKER) - confirmed live against a real dispatch, see
+ * docs/alchemist-bringup.md. gpgpu_process_batch() follows nested jumps
+ * recursively; this bounds recursion depth against malformed/adversarial
+ * content chaining jumps indefinitely - real command buffers never nest
+ * more than one or two levels deep. */
+#define GPGPU_MAX_BATCH_NESTING 4u
+
 /* Bound on how many EU instructions alchemist_gpgpu.c will fetch from a
  * dispatched kernel before giving up looking for a send/EOT - a real
  * trivial OpenCL kernel (mov + send{EOT}, per Phase 12's research) is 2

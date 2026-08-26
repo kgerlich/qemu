@@ -1568,3 +1568,66 @@ all four levels `present=1`, resolving to real, previously-unreachable
 content - the batch's first dword decoded as `hdr=0x7a000004`, a real
 `GFX_OP_PIPE_CONTROL_LEN6` (matching real compute-runtime flush-emission
 code), correctly length-decoded as 6 dwords.
+
+### New gap found immediately after: a second, nested `MI_BATCH_BUFFER_START`
+
+With PPGTT translation now correct, the batch walker (`alchemist_gpgpu.c`)
+advanced past the `PIPE_CONTROL` and found a **second**
+`MI_BATCH_BUFFER_START` (`hdr=0x18800101`) at batch offset 0x18 - real
+compute-runtime command buffers open with a setup/flush `PIPE_CONTROL`,
+then jump via this second, nested batch start into the "real" command
+buffer carrying `PIPELINE_SELECT`/`STATE_BASE_ADDRESS`/`CFE_STATE`/
+`COMPUTE_WALKER`. `gpgpu_process_batch()` only ever followed the
+ring-to-first-batch jump (from `alchemist_gpgpu_process_ring()`); a
+nested jump found while already inside a batch fell through to the
+generic length-decode skip like any other unrecognized instruction, so
+the real `COMPUTE_WALKER` was never reached.
+
+**The fix**: `gpgpu_process_batch()` now takes `instr_base_addr` and a
+`depth` parameter, recognizes `MI_BATCH_BUFFER_START` inside its own
+walk, and recurses into the resolved nested address - with its own,
+independently-read `MI_BATCH_BUFFER_START_PPGTT_FLAG` bit (never
+inherited from the outer batch, since real hardware always carries its
+own per-jump), propagating `instr_base_addr` forward since
+`STATE_BASE_ADDRESS` is context-wide state, not batch-local. A new
+`GPGPU_MAX_BATCH_NESTING` (4) bounds recursion depth against
+malformed/adversarial content chaining jumps indefinitely - real command
+buffers observed here nest exactly one level deep.
+
+**Evidence** - with both fixes applied, a live run now reaches all the
+way to real kernel fetch and EU execution: the walker follows the nested
+jump, finds the real `COMPUTE_WALKER`, decodes a real
+`instr_base_addr`/kernel-start pointer, and fetches the kernel's full
+64-instruction buffer through 64 independent, all-successful 4-level
+PPGTT translations (`kernel_addr=0x8000ff7e0000 n_fetched=64`) - each
+one a distinct, real GPU VA resolved correctly by the VRAM-node-read fix
+above. `alchemist_eu_run()` then actually executes this real,
+IGC-compiled kernel content.
+
+### Next blocker, honestly flagged: the real kernel uses EU opcodes outside Phase 12's scope
+
+Execution stops with `ALCHEMIST_EU_UNSUPPORTED` - Phase 12's interpreter
+was deliberately scoped to the tiny opcode set (`mov`/`add`/`send`,
+native/uncompacted instruction format only) that the project's own
+trivial self-test kernels use (see Phase 12's file comment); this is the
+*first* time a real, IGC-compiled kernel (from `intel-opencl-icd`'s
+online compiler, not a hand-verified self-test) has reached the
+interpreter at all, and it apparently contains at least one instruction
+or encoding - unidentified this session, no per-instruction trace was
+added - outside that scope. Since job completion signaling
+(`alchemist_submit.c`'s existing ring-epilogue search) runs unconditionally
+after `alchemist_gpgpu_process_ring()` regardless of whether the EU
+thread reached a real `send`, this doesn't manifest as a reset-loop or
+timeout warning at the ring level. In a real guest boot with this fix
+applied, `intel-opencl-icd` still enumerates the platform/device and
+`clBuildProgram()` still succeeds (real IGC online compile, unaffected
+- confirmed unchanged), but the guest produces no further console
+output before the outer test harness's own timeout ends the boot -
+consistent with, but not confirmed as, some later stage of the same
+OpenCL flow (a subsequent job, or `clFinish()`/read-back) stalling on
+something this investigation didn't reach. Flagged honestly as the next
+concrete blocker: extending Phase 12's EU interpreter to cover whatever
+this real kernel actually uses (compacted-format decode and/or
+additional opcodes are both plausible, real gaps - identifying which
+needs targeted instruction-level tracing, not attempted this session)
+rather than guessed at or worked around.
