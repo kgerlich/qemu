@@ -1493,9 +1493,83 @@ it - traced all the way down to the root: `guc_id=8`'s own
 root page table has **zero non-zero entries at all** - a completely
 unbound PPGTT, not a missing leaf or a wrong-level miss.
 
-Not yet root-caused further: whether this is a real VM-sharing mismatch
-(this exec queue's LRC pointing at a different, as-yet-unbound `xe_vm`
-than whatever VM the kernel/buffer content was actually bound into), an
-ordering issue specific to this device model, or something else, is
-flagged honestly as the next concrete blocker - the same discipline used for
-every gap above. No code changes were made for this gap in this session.
+### Investigation: tracking down the unbound root (inconclusive, no fix yet)
+
+A dedicated follow-up session traced this as far as static analysis and
+live memory inspection allow, ruling out several real hypotheses with
+hard evidence rather than assumption - each is recorded here so the
+next attempt doesn't re-tread the same ground:
+
+- **Not a GPU-side (batch-executed) page-table update we're failing to
+  execute.** `xe_migrate_update_pgtables()` (`xe_migrate.c`) always
+  tries `xe_migrate_update_pgtables_cpu()` first, which only returns
+  `-ETIME` (triggering the GPU-batch fallback,
+  `__xe_migrate_update_pgtables()`) under `XE_TEST_ONLY(test &&
+  test->force_gpu)` - a kunit-test-only code path, dead in a real,
+  non-test boot. Production binds are unconditionally CPU-side direct
+  writes into `update->pt_bo->vmap`; there is no "we don't execute the
+  real bind batch" gap to fix here.
+- **Not a stale/single read.** `guc_id=8`'s `CTX_PDP0` was re-read (and
+  its root re-scanned, all 512 entries) at the exact moment its one and
+  only real job's `SCHED_CONTEXT` arrived - not cached from an earlier
+  point.
+- **Not specific to the compute exec queue.** `guc_id=0` (the migrate
+  queue, now working correctly per the fix above) has its *own* real,
+  distinct `CTX_PDP0` (`root=0x3fd6f000`, one page below `guc_id=8`'s
+  `0x3fd6e000`) - and it is **also** completely unbound (zero non-zero
+  entries). Whatever's going on isn't unique to the new compute
+  registration.
+- **Not every registered context lacks a VM** - only the two that matter
+  do, and differently: the six Phase 8/13-era probe-time WA-job contexts
+  (`guc_id` 1,2,3,4,5,6) all have `CTX_PDP0 == 0` (real and expected -
+  those are `vm=NULL` kernel exec queues, confirmed via
+  `xe_gt_record_default_lrcs()`'s `xe_exec_queue_create(xe, NULL, ...)`
+  call). Only `guc_id` 0 and 8 have a *real, non-zero, page-aligned*
+  root address that simply has nothing written into it - a materially
+  different, more specific problem than "no VM at all".
+- **A broad GGTT scan for a populated PPGTT-shaped page elsewhere
+  produced only false positives.** Scanning `0x300000..0x800000` for
+  pages with multiple 8-byte entries whose low 12 bits are a subset of
+  the real valid PTE/PDE flag bits (`PRESENT|RW|PDE_64K|PS|DM`) surfaced
+  a few candidates; the most promising (`0x400000`, 9 matching entries)
+  turned out on raw inspection to be real GPU command-stream content
+  (a repeating `MI`/`GFXPIPE`-header pattern, not a page table) that
+  happened to satisfy the filter by coincidence - a reminder that this
+  kind of structural pattern-matching against real command data is too
+  weak a signal to trust without also checking the raw content, which
+  is exactly what caught it here.
+- **Dynamic debug isn't available as a shortcut.** `xe_vm.c`'s own
+  `vm_dbg()` calls (real, upstream, print the exact VA/range of every
+  MAP/UNMAP - `xe_vm.c:2342` etc.) would have answered this directly,
+  but `/sys/kernel/debug/dynamic_debug/control` has zero entries for
+  `xe_vm.c` in the current guest kernel (`7.0.0-30-generic`) - either
+  `CONFIG_DYNAMIC_DEBUG` isn't enabled for this build or the callsites
+  were compiled out; `dyndbg=` on the kernel command line had no effect
+  either. Getting real, direct evidence of which VM the guest kernel
+  actually bound the kernel/buffer content into would need either a
+  custom-rebuilt `xe.ko` with an unconditional `printk` added (not
+  attempted - real risk of ABI/toolchain mismatch against the stock
+  Ubuntu kernel, a substantial undertaking of its own), or finding
+  another existing observability path in the stock kernel that wasn't
+  found this session.
+
+**Where this leaves it**: the completion-signaling path for real compute
+jobs works correctly (verified directly - `alchemist_submit.c` reaches
+and logs "completion signaled" for `guc_id=8`'s one real job, seqno and
+address both sane), so the *symptom* users would see isn't a
+driver-level hang or reset loop, it's a silent one: `clFinish()`
+completes long before it should be waiting, `alchemist_gpgpu.c`'s
+walker gives up cleanly the moment PPGTT translation fails, but the
+kernel/buffer the compiled program actually needs was never fetched or
+executed, and the eventual read-back would be wrong (never reached
+in this session - the guest just sits in `clEnqueueReadBuffer` or a
+later synchronization point without producing more driver activity to
+observe). The real question - which VM the guest kernel bound the
+`buf[0]=42` kernel's containing allocation into, and why that's
+different from what `guc_id=8`'s LRC references - needs either kernel
+instrumentation (a real rebuild, not attempted) or substantially deeper
+reading of NEO's `xe` backend VM-creation/exec-queue-association code
+than this session covered. Flagged honestly as the next concrete
+blocker, not guessed at or worked around; no functional code changes
+were made in this investigation (all temporary tracing added and
+stripped, same convention as every other phase).
