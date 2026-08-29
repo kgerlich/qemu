@@ -496,6 +496,10 @@
  */
 #define EU_OPCODE_MOV     0x61u  /* Gen12+ only - opcode 1 on Gen9-11 */
 #define EU_OPCODE_ADD     0x40u
+#define EU_OPCODE_AND     0x65u  /* hardware-verified via iga64 -p=12p71
+                                   * against real ocloc-compiled `buf[0]=42`
+                                   * kernel bytes - see docs/alchemist-bringup.md */
+#define EU_OPCODE_OR      0x66u  /* same verification as EU_OPCODE_AND */
 #define EU_OPCODE_SEND    0x31u
 #define EU_OPCODE_SENDC   0x32u
 
@@ -510,6 +514,9 @@
 #define EU_REGFILE_ARF 0u
 #define EU_REGFILE_GRF 1u
 #define EU_ARF_NULL    0u
+#define EU_ARF_CR0     0x80u /* Control Register 0 - hardware-verified via
+                               * iga64 -p=12p71 (`cr0.0` decodes to ARF
+                               * regnum 0x80) */
 
 #define EU_SFID_MESSAGE_GATEWAY 0x3u
 #define EU_SFID_UGM             0xFu

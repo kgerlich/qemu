@@ -1631,3 +1631,72 @@ this real kernel actually uses (compacted-format decode and/or
 additional opcodes are both plausible, real gaps - identifying which
 needs targeted instruction-level tracing, not attempted this session)
 rather than guessed at or worked around.
+
+### Follow-up: instruction-level tracing identifies two real missing opcodes, then a real compaction wall
+
+A follow-up session added temporary per-instruction tracing (pc, decoded
+opcode, exec_size, and - on failure - the raw 16 bytes) to
+`alchemist_eu_run()`, then re-ran the same real guest boot. `iga64
+-p=12p71` (present in the guest's own toolchain, the same disassembler
+this project has hand-verified decode against since Phase 12) turned
+every captured failure into a ground-truth answer rather than a guess:
+
+- **pc=1**: `65 00 00 80 20 82 45 7f 04 00 00 02 c0 ff ff ff` decodes to
+  `(W) and (1|M0) r127.2<1>:ud r0.0<0;1,0>:ud 0xFFFFFFC0:ud` - opcode
+  `0x65` is `AND`, masking r0 (the thread payload header) into a scratch
+  register, real address/ID-computation boilerplate.
+- **pc=4** (after fixing AND): `66 09 00 80 20 82 01 80 00 80 00 01 c0
+  04 c0 04` decodes to `(W) or (1|M0) cr0.0<1>:ud cr0.0<0;1,0>:ud
+  0x4C0:uw` - opcode `0x66` is `OR`, and both its source and destination
+  are `cr0` (Control Register 0), an ARF register this interpreter had
+  never given real storage - only `null` was accepted as an ARF target.
+
+**The fix** (`alchemist_eu.c`/`alchemist_eu.h`): added `EU_OPCODE_AND`/
+`EU_OPCODE_OR` (`0x65`/`0x66`, both confirmed via `iga64`) and
+`eu_exec_and()`/`eu_exec_or()`, factored through a shared
+`eu_fetch_binop_srcs()` helper (structurally identical to the existing
+`eu_exec_add()` operand-fetch shape). `AlchemistEuState` gained a real
+`cr0[32]` field, and `eu_read_operand()`/`eu_write_operand()` now accept
+`EU_ARF_CR0` (`0x80`, also confirmed via `iga64`) as a real read/write
+target alongside `null` - given real storage rather than silently
+no-op'd, so a read-modify-write sequence like the `or` above stays
+genuinely self-consistent, even though nothing in this project's scope
+ever interprets what the control bits themselves mean (no FP rounding
+mode is modeled). The `r0.0<0;1,0>`/`cr0.0<0;1,0>` broadcast source
+regions in both real instructions above turned out not to need any new
+regioning support: at `exec_size` 1 a broadcast read of one element is
+byte-for-byte identical to this interpreter's existing "contiguous"
+read, so the existing default-regioning code decodes both correctly
+as-is.
+
+**Evidence**: with both opcodes and `cr0` storage added, the same real
+kernel now executes five real instructions correctly in sequence (two
+`mov`, `and`, `add`, `or`) before stopping - one more real instruction
+than any test in this project has run before.
+
+**The wall it stops at is real, not a bug**: instruction 6 (`61 09 03 72
+00 01 10 00 61 00 00 80 60 45 05 04`) disassembles via `iga64` as
+`(W) mov (2|M0) r3.0<1>:f r1.0<1;1,0>:f {Compacted,A@1}` - genuinely a
+**compacted (64-bit)** instruction, confirmed directly by `iga64`'s own
+`{Compacted}` annotation (it only consumed the first 8 of the 16 bytes
+handed to it). This is exactly the scope limit this file's header
+comment already named as deliberately deferred - "compacted (64-bit)
+instructions need five separate compiler-controlled lookup tables... to
+decode at all" - and now there's concrete evidence it's genuinely
+needed: this real kernel mixes native and compacted instructions, and
+`alchemist_eu_run()`'s fixed 16-bytes-per-instruction fetch is
+structurally wrong from this point on regardless of which opcodes are
+supported (a compacted instruction is 8 bytes, so every subsequent fetch
+offset is also wrong once one is skipped incorrectly).
+
+**Left as the next, honestly-flagged blocker, not attempted this
+session**: real compacted-instruction decode needs the five real
+compiler-controlled lookup tables (control/subreg/datatype-plus-two
+smaller ones per the file comment) pulled from an authoritative source
+(Mesa's `brw_eu_compact.c`/`brw_nir_compact_static.c`-equivalent tables
+for Gen12.5, or IGA's own bundled tables) - a materially larger, separate
+piece of work from the two-opcode fix above, correctly not rushed into
+this session's scope. No functional code changes were made for this
+part of the investigation - all instruction-level tracing was added,
+used to get ground truth, then stripped, same convention as every other
+phase.

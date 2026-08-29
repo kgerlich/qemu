@@ -40,13 +40,24 @@
  *   send.gtwy (1|M0) null r127 null:0 0x0 0x02000010 {EOT,A@1}
  *   31 09 00 80 04 00 00 00 0c 7f 20 30 00 00 00 00
  *
+ *   (W) and (1|M0) r127.2<1>:ud r0.0<0;1,0>:ud 0xFFFFFFC0:ud
+ *   65 00 00 80 20 82 45 7f 04 00 00 02 c0 ff ff ff  (r0 address masking,
+ *   from a real compiled `buf[0]=42` kernel, found live via this project's
+ *   own guest boot - decode independently confirmed against `iga64
+ *   -p=12p71`)
+ *
  * The regioning this interpreter implements (per-lane contiguous read/
  * write, e.g. `r5.0<8;8,1>:d` = one new dword per channel starting at
- * subreg 0) is exactly the pattern all three real examples above use -
+ * subreg 0) is exactly the pattern the mov/add/send examples above use -
  * the standard/default regioning for a straightforward per-channel
  * operation. Non-default regioning (broadcast reads, cross-row access)
  * is real EU functionality this doesn't decode - flagged as
- * ALCHEMIST_EU_UNSUPPORTED rather than silently mishandled.
+ * ALCHEMIST_EU_UNSUPPORTED rather than silently mishandled - *except*
+ * that this reduces to a no-op distinction at exec_size 1 (the `and`
+ * example's own `r0.0<0;1,0>` broadcast source region is indistinguishable
+ * from a contiguous one-element read when there's only one element to
+ * read), which is why that real instruction decodes correctly without
+ * needing genuine region-stride support yet.
  *
  * `send`'s message descriptor (`desc`) is not stored contiguously in the
  * instruction word - it's scattered across several bit ranges. The
@@ -189,7 +200,9 @@ static void eu_decode(const uint8_t instr[16], EuDecoded *d)
 /* Reads exec_size contiguous elements of `type` starting at
  * grf[regnum].subregnum (the confirmed default/standard regioning
  * pattern - see the file comment) into `out` (exec_size dwords, each
- * zero/sign-extended from the real element width). */
+ * zero/sign-extended from the real element width). The one ARF source
+ * given real storage is cr0 (see AlchemistEuState's comment); any other
+ * ARF read is genuinely unsupported. */
 static bool eu_read_operand(AlchemistEuState *regs, bool is_arf,
                              uint32_t regnum, uint32_t subregnum,
                              uint32_t type, uint32_t exec_size,
@@ -197,14 +210,27 @@ static bool eu_read_operand(AlchemistEuState *regs, bool is_arf,
 {
     uint32_t width = eu_type_width(type);
     uint32_t i;
+    uint8_t *base;
 
-    if (width == 0 || is_arf || regnum >= 128 ||
-        subregnum + exec_size * width > sizeof(regs->grf[0])) {
+    if (width == 0) {
         return false;
+    }
+    if (is_arf) {
+        if (regnum != EU_ARF_CR0 ||
+            subregnum + exec_size * width > sizeof(regs->cr0)) {
+            return false;
+        }
+        base = regs->cr0;
+    } else {
+        if (regnum >= 128 ||
+            subregnum + exec_size * width > sizeof(regs->grf[0])) {
+            return false;
+        }
+        base = regs->grf[regnum];
     }
 
     for (i = 0; i < exec_size; i++) {
-        const uint8_t *p = &regs->grf[regnum][subregnum + i * width];
+        const uint8_t *p = &base[subregnum + i * width];
         uint32_t v = 0;
 
         memcpy(&v, p, width);
@@ -223,21 +249,35 @@ static bool eu_write_operand(AlchemistEuState *regs, bool is_arf,
 {
     uint32_t width = eu_type_width(type);
     uint32_t i;
+    uint8_t *base;
 
-    if (is_arf) {
-        /* ARF destinations (in practice: "null") discard the result -
-         * a real, correct thing to do, not an unhandled case. Any
-         * *other* ARF register (address/accumulator/flag) as a write
-         * target is genuinely unsupported. */
-        return regnum == EU_ARF_NULL;
-    }
-    if (width == 0 || hstride != 1 || regnum >= 128 ||
-        subregnum + exec_size * width > sizeof(regs->grf[0])) {
+    if (width == 0 || hstride != 1) {
         return false;
+    }
+    if (is_arf) {
+        /* "null" discards the result - a real, correct thing to do, not
+         * an unhandled case. cr0 gets real storage (see
+         * AlchemistEuState's comment) so a read-modify-write sequence
+         * stays self-consistent. Any *other* ARF register (address/
+         * accumulator/flag) as a write target is genuinely unsupported. */
+        if (regnum == EU_ARF_NULL) {
+            return true;
+        }
+        if (regnum != EU_ARF_CR0 ||
+            subregnum + exec_size * width > sizeof(regs->cr0)) {
+            return false;
+        }
+        base = regs->cr0;
+    } else {
+        if (regnum >= 128 ||
+            subregnum + exec_size * width > sizeof(regs->grf[0])) {
+            return false;
+        }
+        base = regs->grf[regnum];
     }
 
     for (i = 0; i < exec_size; i++) {
-        memcpy(&regs->grf[regnum][subregnum + i * width], &val[i], width);
+        memcpy(&base[subregnum + i * width], &val[i], width);
     }
     return true;
 }
@@ -368,6 +408,102 @@ static AlchemistEuStatus eu_exec_add(AlchemistEuState *regs,
     return ALCHEMIST_EU_SEND; /* unused - see caller, overwritten */
 }
 
+/*
+ * Shared src0/src1 fetch for the bitwise ops below (AND/OR) - both are
+ * structurally identical to eu_exec_add() (same operand-fetch/write
+ * shape, immediate-or-register each side), only the combining operator
+ * differs, and neither has a real floating-point form (unlike add,
+ * there's no dst_type==EU_TYPE_F case to special-case). Two real,
+ * hardware-verified compiled instructions drove adding these (see
+ * docs/alchemist-bringup.md and the file comment's worked examples):
+ *   (W) and (1|M0) r127.2<1>:ud r0.0<0;1,0>:ud   0xFFFFFFC0:ud
+ *   (W) or  (1|M0) cr0.0<1>:ud  cr0.0<0;1,0>:ud  0x4C0:uw
+ */
+static bool eu_fetch_binop_srcs(AlchemistEuState *regs, const EuDecoded *d,
+                                 uint32_t a[32], uint32_t b[32])
+{
+    uint32_t i;
+
+    if (d->exec_size > 32 || (d->exec_size != 1 && d->exec_size != 8)) {
+        return false;
+    }
+    if (d->src0_is_imm && d->src1_is_imm) {
+        return false; /* not a real encoding */
+    }
+
+    if (d->src0_is_imm) {
+        uint32_t v;
+
+        if (!eu_imm_value(d->imm32, d->src0_type, &v)) {
+            return false;
+        }
+        for (i = 0; i < d->exec_size; i++) {
+            a[i] = v;
+        }
+    } else if (!eu_read_operand(regs, d->src0_is_arf, d->src0_regnum,
+                                 d->src0_subregnum, d->src0_type,
+                                 d->exec_size, a)) {
+        return false;
+    }
+
+    if (d->src1_is_imm) {
+        uint32_t v;
+
+        if (!eu_imm_value(d->imm32, d->src1_type, &v)) {
+            return false;
+        }
+        for (i = 0; i < d->exec_size; i++) {
+            b[i] = v;
+        }
+    } else if (!eu_read_operand(regs, d->src1_is_arf, d->src1_regnum,
+                                 d->src1_subregnum, d->src1_type,
+                                 d->exec_size, b)) {
+        return false;
+    }
+
+    return true;
+}
+
+static AlchemistEuStatus eu_exec_and(AlchemistEuState *regs,
+                                      const EuDecoded *d)
+{
+    uint32_t a[32], b[32], r[32];
+    uint32_t i;
+
+    if (!eu_fetch_binop_srcs(regs, d, a, b)) {
+        return ALCHEMIST_EU_UNSUPPORTED;
+    }
+    for (i = 0; i < d->exec_size; i++) {
+        r[i] = a[i] & b[i];
+    }
+    if (!eu_write_operand(regs, d->dst_is_arf, d->dst_regnum,
+                           d->dst_subregnum, d->dst_hstride, d->dst_type,
+                           d->exec_size, r)) {
+        return ALCHEMIST_EU_UNSUPPORTED;
+    }
+    return ALCHEMIST_EU_SEND; /* unused - see caller, overwritten */
+}
+
+static AlchemistEuStatus eu_exec_or(AlchemistEuState *regs,
+                                     const EuDecoded *d)
+{
+    uint32_t a[32], b[32], r[32];
+    uint32_t i;
+
+    if (!eu_fetch_binop_srcs(regs, d, a, b)) {
+        return ALCHEMIST_EU_UNSUPPORTED;
+    }
+    for (i = 0; i < d->exec_size; i++) {
+        r[i] = a[i] | b[i];
+    }
+    if (!eu_write_operand(regs, d->dst_is_arf, d->dst_regnum,
+                           d->dst_subregnum, d->dst_hstride, d->dst_type,
+                           d->exec_size, r)) {
+        return ALCHEMIST_EU_UNSUPPORTED;
+    }
+    return ALCHEMIST_EU_SEND; /* unused - see caller, overwritten */
+}
+
 uint32_t alchemist_eu_run(AlchemistEuState *regs, const uint8_t *code,
                            uint32_t n_instrs, AlchemistEuSend *send_out,
                            AlchemistEuStatus *status_out)
@@ -390,6 +526,20 @@ uint32_t alchemist_eu_run(AlchemistEuState *regs, const uint8_t *code,
             break;
         case EU_OPCODE_ADD:
             st = eu_exec_add(regs, &d);
+            if (st != ALCHEMIST_EU_SEND) {
+                *status_out = ALCHEMIST_EU_UNSUPPORTED;
+                return pc;
+            }
+            break;
+        case EU_OPCODE_AND:
+            st = eu_exec_and(regs, &d);
+            if (st != ALCHEMIST_EU_SEND) {
+                *status_out = ALCHEMIST_EU_UNSUPPORTED;
+                return pc;
+            }
+            break;
+        case EU_OPCODE_OR:
+            st = eu_exec_or(regs, &d);
             if (st != ALCHEMIST_EU_SEND) {
                 *status_out = ALCHEMIST_EU_UNSUPPORTED;
                 return pc;

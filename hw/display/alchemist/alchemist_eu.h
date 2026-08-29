@@ -20,6 +20,15 @@
  * hardware sub-register addressing is itself byte-granular. */
 typedef struct AlchemistEuState {
     uint8_t grf[128][32];
+    /* cr0 (Control Register 0, the ARF "control" register file) - real
+     * compiled kernels read-modify-write it (e.g. `or cr0.0 cr0.0
+     * 0x4C0:uw`, setting rounding-mode/control bits - see
+     * alchemist_eu.c) even when nothing in this project's scope ever
+     * consults what those bits *mean* (no floating-point rounding is
+     * modeled). Given real storage anyway, sized/addressed exactly like
+     * a GRF register, so the read-modify-write sequence stays real and
+     * self-consistent rather than being silently faked as a no-op. */
+    uint8_t cr0[32];
 } AlchemistEuState;
 
 /* A decoded `send`/`sendc` envelope - see alchemist_eu.c's file comment
