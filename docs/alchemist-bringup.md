@@ -1798,3 +1798,80 @@ computation, executed by a real, unmodified, driver-compiled OpenCL
 kernel, running on this simulated device's own EU interpreter, for the
 first time in this project.
 
+## New bug found and fixed: CCS0's interrupt identity used the wrong engine-class numbering
+
+With the compute kernel actually completing, `alchemist_submit.c`'s
+existing epilogue detection ran and correctly found and matched the real
+ring's `MI_ARB_CHECK`-anchored completion epilogue (independently
+verified by dumping the full real ring content for this job byte-for-
+byte against `MI_EPILOGUE_DWORDS`' expected shape - every field matched,
+including the real seqno `0xffffff81` at the expected offset) and wrote
+the completion seqno. But the guest's `cl_test` never got past
+`clFinish()`.
+
+`alchemist_irq.c`'s own comment already documented the fix needed, for
+a different bug fixed earlier: `REGISTER_CONTEXT`'s `engine_class`
+payload field carries **GuC's own** class numbering
+(`GUC_COMPUTE_CLASS=4`), not xe's internal `enum xe_engine_class`
+(`XE_ENGINE_CLASS_COMPUTE=5`) - and that comment explicitly noted the
+two numberings "only happen to coincide... for RENDER(0) and
+COPY/BLITTER(3)". `alchemist_irq.c`'s `IIR_REG_SELECTOR` response for
+`INTR_CCS0` was reusing the GuC-numbered `XE_ENGINE_CLASS_COMPUTE`
+constant (4) for the interrupt IDENTITY register's engine-class field -
+but that register is decoded by `gt_engine_identity()` (`xe_irq.c`)
+using xe's *own* enum, not GuC's. COMPUTE is exactly the one class where
+the two numberings genuinely diverge, which is why RCS0/BCS0 completion
+interrupts worked fine (0 and 3 are correct in both numberings) but this
+was a real, latent bug for CCS0 - never exercised end-to-end until this
+session, since no compute job had ever completed before now.
+
+Fixed by adding a distinctly-named `XE_HW_ENGINE_CLASS_COMPUTE` (5,
+xe's own numbering) used only in the interrupt-identity path, leaving
+the existing GuC-numbered `XE_ENGINE_CLASS_COMPUTE` (4) untouched for
+its original `REGISTER_CONTEXT` comparison use.
+
+## New, deeper blocker found via live kprobe evidence: compute-job completion never reaches the driver's fence-signaling path
+
+With the identity fix applied, `cl_test` *still* doesn't get past
+`clFinish()` - a real, deeper gap. Live kretprobe/kprobe instrumentation
+(the same ftrace technique from the PPGTT investigation, applied to a
+handful of candidate functions - kallsyms confirms real names after
+`xe.ko` loads, since a kernel module's symbols don't exist in
+`/proc/kallsyms` before that) found the following, precisely:
+
+- During early boot (the six probe-time WA jobs plus the migrate
+  queue's real copy jobs, all RENDER/COPY class), every completion
+  interrupt correctly runs `dg1_irq_handler` → `xe_hw_fence_irq_run` →
+  `guc_exec_queue_free_job` in a tight sequence, dozens of times - this
+  is the real, working completion-signaling chain, confirmed live.
+- During the entire `cl_test` window (from kernel submission through a
+  bounded 40s wait), `xe_hw_fence_irq_run` **never fires again, not
+  once** - `dg1_irq_handler` does still run repeatedly (paired with
+  `xe_guc_ct_fast_path`, generic GuC CTB/G2H traffic), so interrupts are
+  reaching the guest and being processed, just never reaching the
+  hardware-fence-signaling path.
+- This isn't a GT-topology/hw_engine-registration gap: `dmesg` from the
+  same run confirms `ccs0` is *not* in the "fused off" list (`ccs1`/
+  `ccs2`/`ccs3` are, `ccs0` isn't), so the driver does believe a real
+  CCS0 hardware engine exists.
+
+**Where this leaves it**: the raw completion mechanism (seqno write +
+`MI_USER_INTERRUPT` + correctly-identified engine-completion interrupt)
+is proven correct and sufficient for RENDER/COPY-class jobs, including
+the identity fix above. But for this real, first-ever COMPUTE-class
+completion, the driver's interrupt handling clearly runs (confirmed via
+`dg1_irq_handler`/`xe_guc_ct_fast_path`) yet never reaches
+`xe_hw_fence_irq_run`. Plausible causes not yet distinguished with
+evidence: `xe_hw_fence_irq_run` might not be the function real
+GuC-scheduled *user* exec-queue completions signal through at all (as
+opposed to the kernel-internal WA/migrate jobs that happened to use it);
+or `gt_engine_identity()`'s dispatch might route a correctly-identified
+CCS0 identity to a per-hw_engine object our simplified interrupt
+cascade doesn't fully populate. Resolving this with confidence needs
+real `xe_irq.c`/`xe_guc_submit.c` source for this exact kernel build
+(`7.0.0-30-generic`), not further guessing - flagged honestly as the
+next concrete blocker before the full milestone (a `cl_test` `PASS`
+with `buf[0]` read back as `42`) is reached. No functional workaround
+was attempted; the two real bugs found and fixed this session (EU
+compaction/exec_size, CCS0 interrupt identity) stand on their own
+regardless of how this is ultimately resolved.

@@ -144,8 +144,12 @@ void alchemist_irq_mmio_write(AlchemistState *s, hwaddr addr, unsigned size)
                 alchemist_mmio_store32(s, ALCHEMIST_REG_INTR_IDENTITY_REG(bank),
                                         identity);
             } else if (bank == 0 && selector == INTR_CCS0) {
+                /* xe's own internal engine-class numbering here, not
+                 * GuC's XE_ENGINE_CLASS_COMPUTE (see alchemist_regs.h's
+                 * XE_HW_ENGINE_CLASS_COMPUTE comment for why these
+                 * differ and why that matters specifically for CCS0). */
                 identity = INTR_DATA_VALID |
-                           (XE_ENGINE_CLASS_COMPUTE << INTR_ENGINE_CLASS_SHIFT) |
+                           (XE_HW_ENGINE_CLASS_COMPUTE << INTR_ENGINE_CLASS_SHIFT) |
                            (0 << INTR_ENGINE_INSTANCE_SHIFT) |
                            GT_MI_USER_INTERRUPT;
                 alchemist_mmio_store32(s, ALCHEMIST_REG_INTR_IDENTITY_REG(bank),

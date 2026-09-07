@@ -290,6 +290,20 @@
  * switch's `default: return` (silently, correctly-by-design ignoring an
  * unrecognized class) and time out. See docs/alchemist-bringup.md. */
 #define   XE_ENGINE_CLASS_COMPUTE            4u
+/* xe's own internal xe_engine_class numbering (xe_hw_engine_types.h) -
+ * NOT the GuC-class value above. Needed specifically for the interrupt
+ * IDENTITY register response (alchemist_irq.c): gt_engine_identity()
+ * (xe_irq.c) decodes that field using xe's own enum, not GuC's, and
+ * unlike RENDER(0)/COPY(3) - which happen to have the same value in
+ * both enums, which is why those interrupt paths worked without this
+ * distinction ever mattering - COMPUTE genuinely differs (GuC class 4
+ * vs. xe's own class 5). Reusing XE_ENGINE_CLASS_COMPUTE (GuC's value)
+ * here was a real bug: real CCS0 completion interrupts fired at the
+ * register/cascade level but were never recognized by the guest's
+ * identity decode, silently dropped, so clFinish() never unblocked -
+ * confirmed live, first real end-to-end CCS0 exercise this project has
+ * had (see docs/alchemist-bringup.md). */
+#define   XE_HW_ENGINE_CLASS_COMPUTE          5u
 
 /*
  * GuC context registration/scheduling actions - abi/guc_actions_abi.h.
