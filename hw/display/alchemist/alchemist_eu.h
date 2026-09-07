@@ -56,11 +56,14 @@ typedef enum AlchemistEuStatus {
 } AlchemistEuStatus;
 
 /*
- * Executes native (128-bit, uncompacted) EU instructions from `code`
- * (n_instrs * 16 bytes) against `regs`, starting at instruction 0, until
- * a send/sendc is decoded or something unsupported is hit. Returns the
- * number of instructions actually executed before stopping; *status_out
- * and (for ALCHEMIST_EU_SEND) *send_out describe why.
+ * Executes EU instructions from `code` (a budget of n_instrs * 16
+ * bytes - the actual per-instruction size varies: 16 bytes for native
+ * format, 8 for a recognized compacted instruction, see
+ * alchemist_eu.c's eu_decompact()) against `regs`, starting at byte
+ * offset 0, until a send/sendc is decoded or something unsupported is
+ * hit. Returns the number of instructions actually executed before
+ * stopping; *status_out and (for ALCHEMIST_EU_SEND) *send_out describe
+ * why.
  */
 uint32_t alchemist_eu_run(AlchemistEuState *regs, const uint8_t *code,
                            uint32_t n_instrs, AlchemistEuSend *send_out,

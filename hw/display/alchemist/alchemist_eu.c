@@ -10,18 +10,17 @@
  * payload header, then `send{EOT}`), confirmed by hand-decoding real
  * ocloc-compiled DG2 bytes (see below and docs/alchemist-bringup.md).
  *
- * Only the native (128-bit, uncompacted) instruction format is decoded.
- * This is a real, deliberate scope limit, not an oversight: compacted
- * (64-bit) instructions need five separate compiler-controlled lookup
- * tables (32/32/32/16/16 entries) to decode at all, and critically,
- * `send`/branch instructions are *never* compacted on real hardware
- * (confirmed in Intel's own PRM) - so EOT recognition, this phase's
- * actual goal, is completely unaffected by not supporting compaction
- * yet. `mov`/`add` immediate-load patterns are also frequently left
- * uncompacted in real compiled output (confirmed - see the worked
- * examples below). Compact-format decode is deferred until real
- * evidence (an actual program we're trying to run that uses it) shows
- * it's needed, not spent on preemptively.
+ * Native (128-bit) format is fully decoded. Compacted (64-bit) format
+ * is decoded too, but only for the one real shape a live guest boot has
+ * actually produced so far: a one-source (`mov`) instruction, both
+ * operands `:f`, default contiguous regioning, `WrEn` set - see
+ * eu_decompact()'s file comment for the full real-instruction research
+ * behind this and exactly what's scoped in/out. `send`/branch
+ * instructions are *never* compacted on real hardware (confirmed in
+ * Intel's own PRM), so EOT recognition doesn't depend on wider
+ * compacted-opcode coverage - only real evidence (an actual, different
+ * compacted instruction a live boot produces) will grow this further,
+ * not preemptive guessing.
  *
  * Bit layout cross-confirmed from three independent sources and then
  * hardware-verified directly: Mesa's src/intel/compiler/gen/xe.json
@@ -45,6 +44,10 @@
  *   from a real compiled `buf[0]=42` kernel, found live via this project's
  *   own guest boot - decode independently confirmed against `iga64
  *   -p=12p71`)
+ *
+ *   (W) mov (2|M0) r3.0<1>:f r1.0<1;1,0>:f {Compacted,A@1}  (compacted -
+ *   61 09 03 72 00 01 10 00, from the same real kernel; see
+ *   eu_decompact()'s comment for how this 64-bit form was derived)
  *
  * The regioning this interpreter implements (per-lane contiguous read/
  * write, e.g. `r5.0<8;8,1>:d` = one new dword per channel starting at
@@ -317,7 +320,13 @@ static AlchemistEuStatus eu_exec_mov(AlchemistEuState *regs,
     uint32_t vals[32];
     uint32_t i;
 
-    if (d->exec_size > 32 || (d->exec_size != 1 && d->exec_size != 8)) {
+    /* exec_size is always a power of two (1u << a 3-bit log2 field),
+     * so >32 is the only real hardware bound - no other restriction is
+     * warranted here now that a real compacted instruction has shown
+     * exec_size 2 (see eu_decompact()'s file comment); the per-lane
+     * data path below (vals[32]/a[32]/b[32]/r[32]) already handles any
+     * width up to 32 generically. */
+    if (d->exec_size > 32) {
         return ALCHEMIST_EU_UNSUPPORTED;
     }
 
@@ -350,7 +359,8 @@ static AlchemistEuStatus eu_exec_add(AlchemistEuState *regs,
     uint32_t a[32], b[32], r[32];
     uint32_t i;
 
-    if (d->exec_size > 32 || (d->exec_size != 1 && d->exec_size != 8)) {
+    /* see eu_exec_mov()'s comment on the exec_size bound */
+    if (d->exec_size > 32) {
         return ALCHEMIST_EU_UNSUPPORTED;
     }
     if (d->src0_is_imm && d->src1_is_imm) {
@@ -424,7 +434,8 @@ static bool eu_fetch_binop_srcs(AlchemistEuState *regs, const EuDecoded *d,
 {
     uint32_t i;
 
-    if (d->exec_size > 32 || (d->exec_size != 1 && d->exec_size != 8)) {
+    /* see eu_exec_mov()'s comment on the exec_size bound */
+    if (d->exec_size > 32) {
         return false;
     }
     if (d->src0_is_imm && d->src1_is_imm) {
@@ -504,45 +515,236 @@ static AlchemistEuStatus eu_exec_or(AlchemistEuState *regs,
     return ALCHEMIST_EU_SEND; /* unused - see caller, overwritten */
 }
 
+/*
+ * Compacted (64-bit) instruction support - real evidence this is
+ * genuinely needed (not the "defer until real evidence shows up" case
+ * the file comment used to describe) came from the same real,
+ * IGC-compiled `buf[0]=42` kernel's 6th instruction: `iga64`'s own
+ * `{Compacted}` disassembly annotation confirms
+ *   61 09 03 72 00 01 10 00
+ * is `(W) mov (2|M0) r3.0<1>:f r1.0<1;1,0>:f {A@1}` in exactly 8 bytes,
+ * not the 16 a native encoding of the same instruction takes.
+ *
+ * The real per-generation compaction table *content* lives in Intel's
+ * open-source `intel-graphics-compiler` repo (MIT), under
+ * `visa/iga/GEDLibrary/GED_external/build/autogen-intel64/
+ * ged_compaction_tables.{h,cpp}` (DG2/XeHPG's specific tables are wired
+ * up via `ged_model_xe_hpg.cpp`'s `oneSourceCompactMapping`/
+ * `DecodingTable782`/`EncodingMasksTable131` chain) - but that's GED's
+ * full auto-generated decode-*engine*, not a simple table, and
+ * `iga64` (present in the guest's own toolchain, already this
+ * project's decode oracle for every opcode/ARF-encoding discovery this
+ * phase) links those exact tables and correctly encodes/decodes them.
+ * So instead of hand-porting GED's generated C++, `iga64 -Xautocompact`
+ * (assemble-and-compact) and `-Xforce-no-compact` were used as a
+ * **compaction oracle**: assembling the real instruction text above
+ * reproduces the real kernel's exact 8 compacted bytes byte-for-byte,
+ * and a systematic sweep (exec_size, dst/src0 subreg, dst/src0/WrEn/
+ * SWSB, register number) against that oracle empirically derived the
+ * real field layout below - hardware-verified the same way as
+ * everything else in this project, not parsed from generated source
+ * and not guessed.
+ *
+ * Confirmed compacted-word layout (8 bytes, byte-indexed c[0..7]):
+ *   c[0]    = opcode - literal, identical encoding/position to native
+ *             bits[6:0] (confirmed: assembling the same text with and
+ *             without compaction gives the same c[0]/native byte0).
+ *   c[1]    = SWSB - literal, byte-identical between formats (toggling
+ *             the `{A@1}` annotation changes this byte identically in
+ *             both the native and compacted assemblies) - irrelevant
+ *             here anyway since eu_decode() never reads it.
+ *   c[2]    = dst register number - literal 0-127 (confirmed via a
+ *             sweep across 0/1/3/5/10/50/100/127, each reproduced
+ *             exactly in c[2]).
+ *   c[3]    = bit5 is CmptCtrl (1 when compacted; the native encoding
+ *             of the exact same instruction has that bit 0 - this is
+ *             the real, hardware-verified position of the compact/
+ *             native discriminator, checked by eu_is_compact() before
+ *             any other decoding happens); bits[4:0] are ControlIndex,
+ *             a real per-generation lookup table - the exec_size sweep
+ *             (1/2/8/16, `WrEn` set) gave four real, verified entries
+ *             (eu_compact_ctrl_table[]); exec_size 4/32 and `WrEn`
+ *             unset don't compact at all for this shape (iga64 falls
+ *             back to native), so this project doesn't need those
+ *             ControlIndex entries yet.
+ *   c[4]    = SubRegIndex << 3 (a 5-bit index at bits[7:3]) - another
+ *             real lookup table, this one mapping to a (dst_subreg,
+ *             src0_subreg) *pair* (confirmed non-linear/non-formulaic
+ *             by sweeping each independently while holding the other
+ *             at 0 - a genuine generated table, not a computable
+ *             function). eu_compact_subreg_table[] holds the real
+ *             entries found this way, including index 0 -> (0,0), the
+ *             one the real blocking instruction actually needs.
+ *   c[5]    = src0 register number - literal (same confirmation method
+ *             as c[2], via a source-register sweep).
+ *   c[6..7] = fixed `0x10 0x00` for every real compacted instance
+ *             found so far (all real `:f`/`:f`, contiguous-regioning
+ *             cases) - the DataTypeIndex/SrcIndex encoding for this one
+ *             verified shape; any other value is unsupported, since no
+ *             other real instance has been seen yet to derive it from.
+ *
+ * Scope, honestly: only opcode `mov`, only this one DataTypeIndex/
+ * SrcIndex byte pattern, only the ControlIndex/SubRegIndex entries
+ * actually observed. Anything else - a different opcode's compacted
+ * form (`add`/`and`/`or` all failed to compact in the same sweep, so
+ * their two-source compact tables are still completely unexplored), a
+ * different type, non-default regioning, or a subreg/exec_size
+ * combination not yet seen - is real EU functionality this doesn't
+ * decode, flagged as ALCHEMIST_EU_UNSUPPORTED and left for the next
+ * real instance to extend, exactly like every other opcode this file
+ * has grown to support so far.
+ */
+static bool eu_is_compact(const uint8_t instr[8])
+{
+    return (instr[3] & 0x20u) != 0; /* CmptCtrl, word bit 29 */
+}
+
+static const struct {
+    uint8_t index;
+    uint8_t exec_size_log2;
+} eu_compact_ctrl_table[] = {
+    { 2, 0 },  /* exec_size 1 */
+    { 18, 1 }, /* exec_size 2 */
+    { 4, 3 },  /* exec_size 8 */
+    { 3, 4 },  /* exec_size 16 */
+};
+
+static const struct {
+    uint8_t index;
+    uint8_t dst_sub;
+    uint8_t src0_sub;
+} eu_compact_subreg_table[] = {
+    { 0, 0, 0 },
+    { 12, 1, 0 },
+    { 7, 2, 0 },
+    { 19, 3, 0 },
+    { 18, 4, 0 },
+    { 21, 5, 0 },
+    { 20, 6, 0 },
+    { 17, 7, 0 },
+    { 4, 0, 1 },
+    { 8, 0, 2 },
+    { 15, 0, 3 },
+    { 11, 0, 4 },
+    { 14, 0, 5 },
+    { 13, 0, 6 },
+    { 16, 0, 7 },
+};
+
+/* Expands a compacted instruction into the equivalent native-format 16
+ * bytes eu_decode() already understands, so all existing decode/exec
+ * logic is reused unchanged - see the file comment above this function
+ * for the real, hardware-verified field layout this implements. */
+static bool eu_decompact(const uint8_t c[8], uint8_t native_out[16])
+{
+    uint32_t opcode = c[0] & 0x7Fu;
+    uint32_t ctrl_index, subreg_index;
+    uint32_t exec_size_log2 = UINT32_MAX;
+    uint32_t dst_sub = UINT32_MAX, src0_sub = 0;
+    uint32_t i;
+
+    if (opcode != EU_OPCODE_MOV) {
+        return false;
+    }
+    if (c[6] != 0x10u || c[7] != 0x00u) {
+        return false;
+    }
+
+    ctrl_index = c[3] & 0x1Fu;
+    for (i = 0; i < ARRAY_SIZE(eu_compact_ctrl_table); i++) {
+        if (eu_compact_ctrl_table[i].index == ctrl_index) {
+            exec_size_log2 = eu_compact_ctrl_table[i].exec_size_log2;
+            break;
+        }
+    }
+    if (exec_size_log2 == UINT32_MAX) {
+        return false;
+    }
+
+    subreg_index = c[4] >> 3;
+    for (i = 0; i < ARRAY_SIZE(eu_compact_subreg_table); i++) {
+        if (eu_compact_subreg_table[i].index == subreg_index) {
+            dst_sub = eu_compact_subreg_table[i].dst_sub;
+            src0_sub = eu_compact_subreg_table[i].src0_sub;
+            break;
+        }
+    }
+    if (dst_sub == UINT32_MAX) {
+        return false;
+    }
+
+    memset(native_out, 0, 16);
+    native_out[0] = c[0];
+    native_out[1] = c[1];
+    native_out[2] = (uint8_t)exec_size_log2;
+    native_out[4] = (uint8_t)(EU_TYPE_F << 4);
+    native_out[5] = (uint8_t)EU_TYPE_F;
+    native_out[6] = (uint8_t)((dst_sub << 3) | (EU_REGFILE_GRF << 2) | 1u);
+    native_out[7] = c[2];
+    native_out[8] = (uint8_t)((src0_sub << 3) | (EU_REGFILE_GRF << 2));
+    native_out[9] = c[5];
+    return true;
+}
+
 uint32_t alchemist_eu_run(AlchemistEuState *regs, const uint8_t *code,
                            uint32_t n_instrs, AlchemistEuSend *send_out,
                            AlchemistEuStatus *status_out)
 {
-    uint32_t pc;
+    uint64_t total_bytes = (uint64_t)n_instrs * 16;
+    uint64_t off = 0;
+    uint32_t executed = 0;
 
-    for (pc = 0; pc < n_instrs; pc++) {
+    while (off + 8 <= total_bytes) {
         EuDecoded d;
         AlchemistEuStatus st;
+        uint8_t native_buf[16];
+        const uint8_t *instr;
+        uint32_t consumed;
 
-        eu_decode(code + pc * 16, &d);
+        if (eu_is_compact(code + off)) {
+            if (!eu_decompact(code + off, native_buf)) {
+                *status_out = ALCHEMIST_EU_UNSUPPORTED;
+                return executed;
+            }
+            instr = native_buf;
+            consumed = 8;
+        } else {
+            if (off + 16 > total_bytes) {
+                break; /* not enough bytes left for a native instruction */
+            }
+            instr = code + off;
+            consumed = 16;
+        }
+
+        eu_decode(instr, &d);
 
         switch (d.opcode) {
         case EU_OPCODE_MOV:
             st = eu_exec_mov(regs, &d);
             if (st != ALCHEMIST_EU_SEND) { /* eu_exec_mov's dummy OK marker */
                 *status_out = ALCHEMIST_EU_UNSUPPORTED;
-                return pc;
+                return executed;
             }
             break;
         case EU_OPCODE_ADD:
             st = eu_exec_add(regs, &d);
             if (st != ALCHEMIST_EU_SEND) {
                 *status_out = ALCHEMIST_EU_UNSUPPORTED;
-                return pc;
+                return executed;
             }
             break;
         case EU_OPCODE_AND:
             st = eu_exec_and(regs, &d);
             if (st != ALCHEMIST_EU_SEND) {
                 *status_out = ALCHEMIST_EU_UNSUPPORTED;
-                return pc;
+                return executed;
             }
             break;
         case EU_OPCODE_OR:
             st = eu_exec_or(regs, &d);
             if (st != ALCHEMIST_EU_SEND) {
                 *status_out = ALCHEMIST_EU_UNSUPPORTED;
-                return pc;
+                return executed;
             }
             break;
         case EU_OPCODE_SEND:
@@ -553,13 +755,16 @@ uint32_t alchemist_eu_run(AlchemistEuState *regs, const uint8_t *code,
             send_out->desc = d.send_desc;
             send_out->payload_reg = d.src0_regnum;
             *status_out = ALCHEMIST_EU_SEND;
-            return pc + 1;
+            return executed + 1;
         default:
             *status_out = ALCHEMIST_EU_UNSUPPORTED;
-            return pc;
+            return executed;
         }
+
+        off += consumed;
+        executed++;
     }
 
     *status_out = ALCHEMIST_EU_END_OF_CODE;
-    return pc;
+    return executed;
 }

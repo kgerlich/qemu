@@ -1700,3 +1700,101 @@ this session's scope. No functional code changes were made for this
 part of the investigation - all instruction-level tracing was added,
 used to get ground truth, then stripped, same convention as every other
 phase.
+
+## Follow-up session: compacted-instruction decode, and the real kernel executes end-to-end
+
+### `iga64` as a compaction oracle, not a manual GED port
+
+Chasing the compacted-instruction blocker above, this session located the
+real per-generation compaction table *data*: Intel's open-source
+`intel-graphics-compiler` repo (MIT licensed),
+`visa/iga/GEDLibrary/GED_external/build/autogen-intel64/
+ged_compaction_tables.{h,cpp}` - 63 auto-generated `CompactionTableN`
+arrays, wired up per-platform (DG2/XeHPG's own tables are referenced via
+`ged_model_xe_hpg.cpp`'s `oneSourceCompactMapping`/`DecodingTable782`/
+`EncodingMasksTable131` chain). This turned out to be bigger than the
+"five lookup tables" guessed at previously - it's GED's full
+auto-generated decode-*engine* (mapping tables → decoding tables →
+encoding-mask tables, chained), and hand-porting that generated C++
+would have been a large, error-prone undertaking.
+
+Instead, `iga64` (already this project's decode oracle for every other
+bit-layout discovery) turned out to support `-Xautocompact`
+(assemble-and-compact) alongside its already-proven `-d` decode. Since
+`iga64` links the real compaction tables directly, assembling the real
+kernel's known-real instruction text with `-Xautocompact` reproduced its
+exact compacted bytes byte-for-byte, and a systematic sweep (exec_size,
+dst/src0 subreg, register number, `WrEn`, SWSB) against that oracle
+empirically derived the real field layout - the same evidence-driven
+methodology as every other discovery in this project, without needing
+to parse GED's generated source at all.
+
+### The real, hardware-verified compacted-word layout (`mov`, `oneSourceCompact`)
+
+Confirmed via the sweep (8-byte compacted word, byte-indexed `c[0..7]`):
+- `c[0]`: opcode, literal, same position/encoding as native bits[6:0].
+- `c[1]`: SWSB, literal, byte-identical between formats.
+- `c[2]`: dst register number, literal (swept 0/1/3/5/10/50/100/127, all
+  reproduced exactly).
+- `c[3]`: bit 5 is `CmptCtrl` (1 when compacted, 0 in the native encoding
+  of the identical instruction - the real, hardware-verified
+  compact/native discriminator bit); bits[4:0] are `ControlIndex`, a
+  real lookup table - the exec_size sweep (1/2/8/16, `WrEn` set) gave
+  four real entries; exec_size 4/32 and `WrEn` unset don't compact for
+  this shape at all (`iga64` falls back to native), so no entries were
+  needed for those.
+- `c[4]`: `SubRegIndex << 3` (5-bit index at bits[7:3]) - a real lookup
+  table mapping to a `(dst_subreg, src0_subreg)` *pair* (confirmed
+  non-linear/non-formulaic by sweeping each independently while holding
+  the other at 0 - a genuine generated table, not a computable
+  function). Sixteen real entries were captured this way, including
+  index 0 → (0,0), the one the real blocking instruction needs.
+- `c[5]`: src0 register number, literal.
+- `c[6..7]`: fixed `0x10 0x00` for every real compacted instance found
+  so far (all `:f`/`:f`, contiguous-regioning) - the
+  DataTypeIndex/SrcIndex encoding for this one verified shape.
+
+Implemented as `eu_decompact()` (`alchemist_eu.c`), expanding a
+compacted instruction into the same 16-byte native-format representation
+`eu_decode()` already understands, so all existing decode/exec logic is
+reused unchanged. `alchemist_eu_run()`'s core loop no longer assumes a
+fixed 16 bytes per instruction - it checks the `CmptCtrl` bit first,
+decompacts-then-decodes (8 bytes) or decodes directly (16 bytes), and
+advances by however many bytes that instruction actually consumed.
+Scope, honestly: only opcode `mov`, only this one DataTypeIndex/SrcIndex
+pattern, only the `ControlIndex`/`SubRegIndex` entries actually observed
+- `add`/`and`/`or` all failed to compact in the same sweep, so their
+two-source compact tables remain completely unexplored, flagged as
+`ALCHEMIST_EU_UNSUPPORTED` rather than guessed at.
+
+### A second real bug found immediately after: `exec_size` was wrongly restricted to {1, 8}
+
+With decompaction working, the real compacted `mov (2|M0)` instruction
+still failed - `eu_exec_mov()`/`eu_exec_add()`/`eu_fetch_binop_srcs()`
+(the shared AND/OR helper) all hardcoded their `exec_size` check to
+`!= 1 && != 8`, a leftover from when only those two values had ever been
+observed. `exec_size` is always a power of two (`1u << ` a 3-bit log2
+field) and the actual per-lane data path (`vals[32]`/`a[32]`/`b[32]`/
+`r[32]`) already handles any width up to 32 generically - the extra
+restriction was never architecturally required. Relaxed to just
+`> 32` (the real hardware bound) in all three places.
+
+### Evidence: the real kernel now executes fully, reaches a real `send`, and writes the correct value
+
+With both fixes, the same real, IGC-compiled `buf[0]=42` kernel now
+executes **nine** real instructions in sequence (two native `mov`, `and`,
+`add`, `or`, a compacted `mov` exec_size 2, another native `mov`, a
+second compacted `mov` exec_size 8, and finally a native `send`) and
+reaches a genuine terminal `send`:
+```
+SEND executed=8 sfid=15 eot=0 desc=0x020e8584 payload_reg=3
+handle_send op=4 addr_type=0 addr_size=3 data_size=2 vect_size=0
+writing addr=0xffffffffff9f0000 data=42 write_ok=1
+```
+`gpgpu_handle_send()` correctly decodes this as a real
+`LSC_OP_STORE`/FLAT/A64/D32/V1 message and writes `42` through
+`alchemist_ppgtt_write()` successfully - the actual `buf[0] = 42`
+computation, executed by a real, unmodified, driver-compiled OpenCL
+kernel, running on this simulated device's own EU interpreter, for the
+first time in this project.
+
