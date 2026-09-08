@@ -1953,14 +1953,56 @@ kernel's own IRQ handler never runs at all - not a driver dispatch bug
 `msi_notify()` call and the guest's interrupt handler actually being
 invoked. This points at QEMU/KVM-level MSI delivery/injection timing -
 a genuinely different investigative domain (host virtualization
-internals, not xe driver behavior) than anything else in this project,
-and warrants its own dedicated approach (e.g. instrumenting QEMU's own
-MSI/APIC injection path, or testing whether *any* interrupt raised this
-late in a boot - not just CCS0 - exhibits the same symptom) rather than
-further driver-source reading. Flagged honestly as the next concrete
-blocker before the full milestone (`cl_test` reporting `PASS` with
-`buf[0]` read back as `42`) is reached. No functional workaround was
-attempted; the two real bugs found and fixed this session (EU
-compaction/exec_size, CCS0 interrupt identity) stand on their own
-regardless of how this is ultimately resolved, and the CCS0 identity fix
-remains real and correct even though it wasn't sufficient alone.
+internals, not xe driver behavior) than anything else in this project.
+
+## Follow-up: QEMU-level introspection via QMP - MSI is confirmed correctly requested, delivery still doesn't happen
+
+Rather than guess further at the QEMU/KVM layer, used QEMU's own QMP
+monitor (a second `-qmp unix:...` socket added to the *main* device's
+`qemu-system-x86_64` invocation, distinct from the satellite GuC
+process's existing one) to directly inspect real hypervisor-level state
+while the guest was hung, via `human-monitor-command`:
+
+- **`info lapic` polled every 0.3s for 90 real seconds** (300 samples,
+  spanning well past the point this device's own trace confirms the
+  CCS0 completion is raised) never once showed this device's MSI vector
+  as pending (`IRR`) or in-service (`ISR`) on the guest's local APIC -
+  the only non-empty readings across all 300 samples were the guest's
+  own periodic local-APIC timer (vector 236, `LVTT ... tsc-deadline`),
+  unrelated to this device. This is consistent with (though, given
+  polling granularity, does not on its own *prove*) the kprobe finding
+  that `dg1_irq_handler` never runs - the interrupt does not appear to
+  reach APIC hardware state at all, not just fail to be processed by
+  the driver.
+- **`msi_enabled(&s->pdev)` checked directly at the exact call site**,
+  immediately before `msi_notify()`, via a temporary trace - confirmed
+  `msi_enabled=1` (true) for the real CCS0 completion call, identical
+  to every one of the dozens of successful earlier calls (RCS0/BCS0/
+  GuC2Host) in the same boot. This rules out the plausible, real-PCI-
+  semantics hypothesis that the guest might have transiently disabled
+  MSI reporting (e.g. around a runtime-PM transition) at the moment
+  this device tried to signal - real hardware would also silently drop
+  an MSI raised while disabled, but that isn't what's happening here.
+
+**Where this leaves it**: every hypothesis reachable from this device's
+own code, from real driver source, and from directly-queried QEMU/KVM
+hypervisor state (LAPIC IRR/ISR, MSI capability enable bit) has now
+been checked and ruled out. `alchemist_irq_raise_gt0()` calls the
+identical, unconditional `msi_notify(&s->pdev, 0)` used successfully
+dozens of times earlier in the exact same boot, with MSI confirmed
+enabled at the call site, yet neither the APIC hardware state nor the
+guest's own IRQ handler ever show any sign of it arriving. Continuing
+further needs instrumenting QEMU's own internal MSI-to-KVM injection
+path (`hw/pci/msi.c`'s `msi_send_message()`/`kvm_irqchip_send_msi()`
+and friends) rather than anything reachable from this device model,
+guest driver source, or monitor-level introspection - a legitimately
+different, lower layer of the stack than this project has needed to
+touch before. Flagged honestly as the next concrete blocker before the
+full milestone (`cl_test` reporting `PASS` with `buf[0]` read back as
+`42`) is reached. No functional workaround was attempted; the two real
+bugs found and fixed this session (EU compaction/exec_size, CCS0
+interrupt identity) stand on their own regardless of how this is
+ultimately resolved, and the CCS0 identity fix remains real and correct
+even though it wasn't sufficient alone. All temporary tracing
+(`raise_gt0`'s `msi_enabled` print, the QMP polling scripts) was used
+purely for research and not committed.
