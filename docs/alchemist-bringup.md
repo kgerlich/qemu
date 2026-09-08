@@ -2006,3 +2006,86 @@ ultimately resolved, and the CCS0 identity fix remains real and correct
 even though it wasn't sufficient alone. All temporary tracing
 (`raise_gt0`'s `msi_enabled` print, the QMP polling scripts) was used
 purely for research and not committed.
+
+## Follow-up: traced the full QEMU MSI-injection call chain by real source; host-kernel level is genuinely inconclusive
+
+Continued past the QMP/monitor-level checks by reading QEMU's own MSI
+delivery source directly (`hw/pci/msi.c`, `hw/pci/pci.c`,
+`hw/i386/kvm/apic.c`, `accel/kvm/kvm-all.c`) rather than guessing, and
+temporarily instrumenting QEMU *core* code (not this device's own files
+- reverted before any commit, never shipped) at each step:
+
+- `msi_notify()` (`hw/pci/msi.c`) checks `msi_is_masked(dev, vector)`
+  before sending - a real, plausible-looking early-return path. Ruled
+  out: this device calls `msi_init(pdev, 0, 1, true, false, errp)` with
+  `msi_per_vector_mask=false`, so `PCI_MSI_FLAGS_MASKBIT` is never set
+  and `msi_is_masked()` unconditionally returns `false` for this device
+  - confirmed directly from `msi_is_masked()`'s own source
+    (`if (!(flags & PCI_MSI_FLAGS_MASKBIT)) return false;`).
+- `msi_send_message()` → `pci_msi_trigger()` (`hw/pci/pci.c`) doesn't
+  call into KVM directly at all - it's a plain memory write
+  (`address_space_stl_le(&dev->bus_master_as, msg.address, msg.data,
+  attrs, &result)`) through the device's own bus-master address space,
+  the same space every other DMA read/write in this project already
+  uses. Temporarily captured the real `MemTxResult` (normally discarded
+  via a `NULL` result pointer) for this device specifically: **every**
+  call, including the real CCS0 completion, returned `MEMTX_OK` - the
+  write reaches its target memory region successfully every time.
+- That target is `kvm_apic_io_ops`'s `kvm_apic_mem_write()`
+  (`hw/i386/kvm/apic.c`), which unconditionally calls `kvm_send_msi()`
+  (a different, QEMU-userspace-only function of the same name, not the
+  kernel one) → `kvm_irqchip_send_msi()` (`accel/kvm/kvm-all.c`) →
+  `kvm_vm_ioctl(s, KVM_SIGNAL_MSI, &msi)`, a *direct*, routing-table-free
+  ioctl (unlike IRQFD-based delivery, `KVM_SIGNAL_MSI` needs no
+  pre-established GSI route, so a stale-routing-table hypothesis doesn't
+  apply here). `kvm_send_msi()`'s own error path
+  (`fprintf(stderr, "KVM: injection failed, MSI lost (%s)\n", ...)` on
+  `ret < 0`) has never appeared in any log this session, across every
+  test run - the ioctl reports success from QEMU's own point of view
+  every time, for every source (RENDER/COPY/GuC2Host/CCS0 alike).
+
+**Host-kernel-level kprobe tracing was then attempted** (this device's
+own trace confirming exactly when the real CCS0 completion fires, cross-
+referenced against kprobes on the *host* kernel's own KVM module
+functions - not the guest's) but proved genuinely inconclusive:
+successive attempts at guessing the real kernel-side handler for
+`KVM_SIGNAL_MSI` (`kvm_set_msi`, then `kvm_send_userspace_msi`) each
+showed a small, tightly-clustered count of hits early in the boot and
+never clearly, unambiguously correlated with the later CCS0 completion
+even with a deliberate, temporary `sleep(4)` marker placed immediately
+after this device's own `msi_notify()` call to bound the search window
+precisely. This isn't evidence the kernel-side call doesn't happen -
+it's evidence that individually guessing kernel function names one at a
+time, via simple entry kprobes with no argument filtering, is the wrong
+tool for definitively answering this specific question. A real answer
+needs either `ftrace`'s `function_graph` tracer (to capture the *full*
+call tree of one isolated `KVM_SIGNAL_MSI` ioctl and see conclusively
+what it calls, rather than checking hypotheses one function at a time)
+or argument-filtered kprobes keyed on this device's specific MSI data
+(`0x25`)/address (`0xfee00000`) to be sure the events being counted are
+even this device's, not unrelated guest MSI traffic (virtio-net, etc.)
+that could coincidentally cluster in the same early-boot window. Neither
+was completed this session. All host-kernel kprobes were removed and
+the host's ftrace buffer cleared before finishing; nothing was left
+running on the shared machine.
+
+**Where this leaves it, precisely**: every layer of this device's own
+code, the real xe driver's dispatch logic, and QEMU's own MSI/PCI/memory
+plumbing has been read and/or directly instrumented and confirmed
+correct and successful for the exact same CCS0 completion call that
+never reaches the guest's `dg1_irq_handler`. The only remaining
+candidates are inside the host's own KVM kernel module - a boundary this
+project has now reached but not crossed with certainty. Continuing needs
+either `function_graph` tracing of a single isolated `KVM_SIGNAL_MSI`
+ioctl (the most direct next step) or matching Linux kernel source for
+this exact host kernel build to identify the real handler with
+confidence before probing it - not further individual function-name
+guessing. Flagged honestly as the state of this investigation; the two
+real, committed bugs this session found and fixed (EU compaction/
+exec_size decode, CCS0 interrupt identity numbering) are correct and
+complete regardless of how this final piece resolves, and the actual
+GPU-side compute pipeline - PPGTT translation, command-stream walking,
+EU execution, and the LSC memory write - is proven fully correct and
+working end to end; only this final, host-virtualization-level
+completion-notification question stands between that and the project's
+full milestone.
