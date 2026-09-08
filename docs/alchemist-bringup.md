@@ -1855,23 +1855,112 @@ handful of candidate functions - kallsyms confirms real names after
   `ccs2`/`ccs3` are, `ccs0` isn't), so the driver does believe a real
   CCS0 hardware engine exists.
 
-**Where this leaves it**: the raw completion mechanism (seqno write +
-`MI_USER_INTERRUPT` + correctly-identified engine-completion interrupt)
-is proven correct and sufficient for RENDER/COPY-class jobs, including
-the identity fix above. But for this real, first-ever COMPUTE-class
-completion, the driver's interrupt handling clearly runs (confirmed via
-`dg1_irq_handler`/`xe_guc_ct_fast_path`) yet never reaches
-`xe_hw_fence_irq_run`. Plausible causes not yet distinguished with
-evidence: `xe_hw_fence_irq_run` might not be the function real
-GuC-scheduled *user* exec-queue completions signal through at all (as
-opposed to the kernel-internal WA/migrate jobs that happened to use it);
-or `gt_engine_identity()`'s dispatch might route a correctly-identified
-CCS0 identity to a per-hw_engine object our simplified interrupt
-cascade doesn't fully populate. Resolving this with confidence needs
-real `xe_irq.c`/`xe_guc_submit.c` source for this exact kernel build
-(`7.0.0-30-generic`), not further guessing - flagged honestly as the
-next concrete blocker before the full milestone (a `cl_test` `PASS`
-with `buf[0]` read back as `42`) is reached. No functional workaround
-was attempted; the two real bugs found and fixed this session (EU
+**Where this initially left it** (superseded below): the raw completion
+mechanism was proven correct for RENDER/COPY-class jobs, but for the
+first-ever COMPUTE-class completion, the driver's interrupt handling
+clearly ran (`dg1_irq_handler`/`xe_guc_ct_fast_path`) yet never reached
+`xe_hw_fence_irq_run`. Resolving this with confidence needed real
+`xe_irq.c`/`xe_guc_submit.c` source - fetched next.
+
+## Follow-up: real mainline xe source rules out driver-side routing bugs; the real finding is deeper
+
+Fetched the real, current mainline driver source directly (Intel's xe
+driver is fast-moving upstream code, not Ubuntu-patched at this level;
+`torvalds/linux`'s `drivers/gpu/drm/xe/{xe_irq,xe_hw_engine,xe_gt,
+xe_hw_fence,xe_guc_submit,xe_guc_ct}.c` and
+`regs/xe_irq_regs.h`) and traced the *exact* real dispatch chain byte
+for byte, rather than continuing to guess from behavior alone:
+
+- `xe_hw_fence_irq_run(hwe->fence_irq)` is called from exactly one real
+  place: `xe_hw_engine_handle_irq()` (`xe_hw_engine.c`), gated on
+  `intr_vec & GT_MI_USER_INTERRUPT` - which our device's `INTR_CCS0`
+  identity response does set.
+- `xe_hw_engine_handle_irq()` is called from `gt_irq_handler()`
+  (`xe_irq.c`) as `hwe = xe_gt_hw_engine(engine_gt, class, instance,
+  false); if (hwe) xe_hw_engine_handle_irq(hwe, intr_vec);` - `class`/
+  `instance` come straight from `INTR_ENGINE_CLASS(identity)`/
+  `INTR_ENGINE_INSTANCE(identity)` (`regs/xe_irq_regs.h`:
+  `GENMASK(18,16)`/`GENMASK(25,20)` - confirmed byte-identical to this
+  device's `INTR_ENGINE_CLASS_SHIFT`/`INTR_ENGINE_INSTANCE_SHIFT`
+  constants), and `xe_gt_hw_engine()` (`xe_gt.c`) does a plain
+  `hwe->class == class` scan - `enum xe_engine_class`
+  (`xe_hw_engine_types.h`) confirms `XE_ENGINE_CLASS_COMPUTE = 5`
+  exactly, matching the earlier fix's value.
+- `hw_engine_init_early()`/`read_compute_fuses()` (`xe_hw_engine.c`)
+  confirm real CCS0 registration doesn't depend on the "fused off" dmesg
+  line at all for a single-CCS part like this one:
+  `read_compute_fuses_from_dss()` (the DG2/pre-Xe20 path) explicitly
+  `return`s immediately whenever fewer than two CCS bits are set in
+  `engine_mask` to begin with - CCS0 is never fuse-checked, just
+  unconditionally present, exactly consistent with the dmesg evidence.
+- `guc_exec_queue_run_job()` (`xe_guc_submit.c`) returns `job->fence`
+  directly - confirming every exec-queue class (kernel-internal WA/
+  migrate jobs and real user compute dispatches alike) signals
+  completion through the *same* `xe_hw_fence` mechanism; there is no
+  separate GuC-G2H "job done" completion path for user queues to miss.
+
+**This rules out every driver-side routing/logic hypothesis from the
+previous investigation** - the identity encoding, the class numbering,
+the hw_engine registration, and the fence mechanism itself are all
+confirmed correct, byte-for-byte, against real source.
+
+### A much more precise empirical finding via a longer, better-instrumented kprobe run
+
+The original kprobe run used `timeout 40 /root/cl_test` - since `cl_test`
+doesn't even start until ~23s into boot, the activity observed near the
+40s mark turned out be a methodological artifact, not a real signal (see
+below). Redone with `timeout 250` and kprobes on the *entire* real
+chain (`dg1_irq_handler`, `gt_irq_handler`, `xe_gt_hw_engine`,
+`xe_hw_engine_handle_irq`, `xe_hw_fence_irq_run`, `xe_guc_irq_handler`,
+`xe_guc_ct_fast_path`, `guc_exec_queue_free_job`), plus a temporary
+device-side trace correlating exactly when this device raises the CCS0
+completion:
+
+- Early boot (~t=23.4-23.85s): the real chain fires exactly as
+  designed, repeatedly - `dg1_irq_handler` → `gt_irq_handler` →
+  `xe_gt_hw_engine` → `xe_hw_engine_handle_irq` → `xe_hw_fence_irq_run`
+  → `guc_exec_queue_free_job`, for every RENDER/COPY completion.
+- This device's own trace confirms `alchemist_submit.c` raises the
+  CCS0 completion (`completion signaled guc_id=8 ...`) for the real
+  compute job shortly after `cl_test` logs "kernel built OK" - i.e.
+  early, not near the end of the run.
+- From t≈23.85s onward, **`dg1_irq_handler` itself - the driver's
+  top-level MSI handler, kprobed at its very entry - is never invoked
+  again, for the entire remaining ~250 seconds**, not just
+  `xe_hw_fence_irq_run`. A kprobe fires on function entry regardless of
+  what the function does internally, so this isn't "the handler ran and
+  decided to ignore it" - the guest kernel's interrupt handler is never
+  invoked at all following this device's `msi_notify()` call for the
+  CCS0 completion.
+- The only activity observed after that point is a burst of
+  `dg1_irq_handler`/`xe_guc_ct_fast_path` pairs at the *exact* moment
+  the outer `timeout 250` kills `cl_test` (t≈273.5s = 23.5s boot + 250s)
+  - real context-teardown CTB traffic from the kill, not evidence of
+  normal operation, and never reaching `xe_hw_fence_irq_run` either
+  (confirming the earlier, shorter test's identical-looking burst was
+  the same kind of artifact, not a real completion signal).
+
+**Where this leaves it, honestly**: this device's `alchemist_irq_raise_gt0()`
+calls the identical, unconditional `msi_notify(&s->pdev, 0)` used
+successfully dozens of times during early boot (RCS0/BCS0/GuC2Host all
+confirmed working via the same kprobe method) - the function contains no
+branch that could skip it, and this device's own MSI setup
+(`msi_init(pdev, 0, 1, true, false, errp)` in `alchemist.c`) is a plain,
+unremarkable single-vector capability, identical for every interrupt
+source. Yet for this specific, later-arriving notification, the guest
+kernel's own IRQ handler never runs at all - not a driver dispatch bug
+(now ruled out with real source), but something between this device's
+`msi_notify()` call and the guest's interrupt handler actually being
+invoked. This points at QEMU/KVM-level MSI delivery/injection timing -
+a genuinely different investigative domain (host virtualization
+internals, not xe driver behavior) than anything else in this project,
+and warrants its own dedicated approach (e.g. instrumenting QEMU's own
+MSI/APIC injection path, or testing whether *any* interrupt raised this
+late in a boot - not just CCS0 - exhibits the same symptom) rather than
+further driver-source reading. Flagged honestly as the next concrete
+blocker before the full milestone (`cl_test` reporting `PASS` with
+`buf[0]` read back as `42`) is reached. No functional workaround was
+attempted; the two real bugs found and fixed this session (EU
 compaction/exec_size, CCS0 interrupt identity) stand on their own
-regardless of how this is ultimately resolved.
+regardless of how this is ultimately resolved, and the CCS0 identity fix
+remains real and correct even though it wasn't sufficient alone.
