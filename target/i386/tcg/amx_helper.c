@@ -382,3 +382,119 @@ void HELPER(tdpbf16ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
     }
     tdp_finish(env, c, rows);
 }
+
+/* IEEE half to single; half-precision denormals are valid inputs.  */
+static float32 amx_fp16_in(uint16_t v, float_status *st)
+{
+    float_status cvt = *st;
+
+    set_flush_inputs_to_zero(false, &cvt);
+    return float16_to_float32(v, true, &cvt);
+}
+
+static float_status amx_fp_status(CPUX86State *env)
+{
+    float_status st = env->sse_status;
+
+    set_float_rounding_mode(float_round_nearest_even, &st);
+    set_flush_to_zero(true, &st);
+    set_flush_inputs_to_zero(true, &st);
+    return st;
+}
+
+/* TDPFP16PS: like TDPBF16PS, with IEEE half-precision elements.  */
+void HELPER(tdpfp16ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
+                       uint32_t src2)
+{
+    uintptr_t ra = GETPC();
+    uint8_t *c = env->xtiledata + dst * AMX_TILE_BYTES;
+    const uint8_t *a = env->xtiledata + src1 * AMX_TILE_BYTES;
+    const uint8_t *b = env->xtiledata + src2 * AMX_TILE_BYTES;
+    float_status st = amx_fp_status(env);
+    unsigned rows, kdw, ndw, m, k, n;
+
+    tdp_check(env, dst, src1, src2, ra);
+    rows = tilecfg_rows(env->xtilecfg, dst);
+    kdw = tilecfg_colsb(env->xtilecfg, src1) / 4;
+    ndw = tilecfg_colsb(env->xtilecfg, dst) / 4;
+
+    for (m = 0; m < rows; m++) {
+        uint32_t tmp[AMX_MAX_COLSB / 4];
+
+        for (n = 0; n < ndw; n++) {
+            float32 even = float32_zero, odd = float32_zero, sum, old;
+
+            for (k = 0; k < kdw; k++) {
+                const uint8_t *arow = a + m * AMX_MAX_COLSB + 4 * k;
+                const uint8_t *brow = b + k * AMX_MAX_COLSB + 4 * n;
+
+                even = float32_muladd(amx_fp16_in(lduw_le_p(arow), &st),
+                                      amx_fp16_in(lduw_le_p(brow), &st),
+                                      even, 0, &st);
+                odd = float32_muladd(amx_fp16_in(lduw_le_p(arow + 2), &st),
+                                     amx_fp16_in(lduw_le_p(brow + 2), &st),
+                                     odd, 0, &st);
+            }
+            sum = float32_add(even, odd, &st);
+            old = ldl_le_p(c + m * AMX_MAX_COLSB + 4 * n);
+            tmp[n] = float32_add(old, sum, &st);
+        }
+        tdp_finish_row(c, m, tmp, ndw);
+    }
+    tdp_finish(env, c, rows);
+}
+
+/*
+ * TCMMRLFP16PS / TCMMIMFP16PS: each dword is a complex number (real part in
+ * the low half).  Two FP32 lanes per result accumulate over k with one FMA
+ * per product; then the lanes are added and added to the accumulator.  Real
+ * part: lane 0 gets re*re, lane 1 gets -im*im.  Imaginary part: lane 0 gets
+ * im(a)*re(b), lane 1 gets re(a)*im(b).
+ */
+void HELPER(tcmmfp16ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
+                        uint32_t src2, uint32_t imag)
+{
+    uintptr_t ra = GETPC();
+    uint8_t *c = env->xtiledata + dst * AMX_TILE_BYTES;
+    const uint8_t *a = env->xtiledata + src1 * AMX_TILE_BYTES;
+    const uint8_t *b = env->xtiledata + src2 * AMX_TILE_BYTES;
+    float_status st = amx_fp_status(env);
+    unsigned rows, kdw, ndw, m, k, n;
+
+    tdp_check(env, dst, src1, src2, ra);
+    rows = tilecfg_rows(env->xtilecfg, dst);
+    kdw = tilecfg_colsb(env->xtilecfg, src1) / 4;
+    ndw = tilecfg_colsb(env->xtilecfg, dst) / 4;
+
+    for (m = 0; m < rows; m++) {
+        uint32_t tmp[AMX_MAX_COLSB / 4];
+
+        for (n = 0; n < ndw; n++) {
+            float32 lane0 = float32_zero, lane1 = float32_zero, sum, old;
+
+            for (k = 0; k < kdw; k++) {
+                const uint8_t *arow = a + m * AMX_MAX_COLSB + 4 * k;
+                const uint8_t *brow = b + k * AMX_MAX_COLSB + 4 * n;
+                float32 are = amx_fp16_in(lduw_le_p(arow), &st);
+                float32 aim = amx_fp16_in(lduw_le_p(arow + 2), &st);
+                float32 bre = amx_fp16_in(lduw_le_p(brow), &st);
+                float32 bim = amx_fp16_in(lduw_le_p(brow + 2), &st);
+
+                if (imag) {
+                    lane0 = float32_muladd(aim, bre, lane0, 0, &st);
+                    lane1 = float32_muladd(are, bim, lane1, 0, &st);
+                } else {
+                    lane0 = float32_muladd(are, bre, lane0, 0, &st);
+                    lane1 = float32_muladd(aim, bim, lane1,
+                                           float_muladd_negate_product, &st);
+                }
+            }
+            sum = float32_add(lane0, lane1, &st);
+            old = ldl_le_p(c + m * AMX_MAX_COLSB + 4 * n);
+            tmp[n] = float32_add(old, sum, &st);
+        }
+        tdp_finish_row(c, m, tmp, ndw);
+    }
+    tdp_finish(env, c, rows);
+}
+

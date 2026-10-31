@@ -5148,6 +5148,24 @@ static void gen_TDPBF16PS(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_tdpbf16ps(tcg_env, dst, src1, src2);
 }
 
+static void gen_TDPFP16PS(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i32 dst, src1, src2;
+
+    gen_tdp_regs(s, &dst, &src1, &src2);
+    gen_helper_tdpfp16ps(tcg_env, dst, src1, src2);
+}
+
+/* No prefix is TCMMRLFP16PS (real part), 66 is TCMMIMFP16PS (imaginary part).  */
+static void gen_TCMMxxFP16PS(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i32 dst, src1, src2;
+
+    gen_tdp_regs(s, &dst, &src1, &src2);
+    gen_helper_tcmmfp16ps(tcg_env, dst, src1, src2,
+                          tcg_constant_i32((s->prefix & PREFIX_DATA) != 0));
+}
+
 static void gen_XRSTORS(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();

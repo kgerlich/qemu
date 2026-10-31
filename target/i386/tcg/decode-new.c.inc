@@ -770,16 +770,33 @@ static void decode_amx_cfg(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
 
 static void decode_amx_tdp(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
-    /* 0F38 5E: TDPB{SS,SU,US,UU}D, 5C: TDPBF16PS; registers only.  */
+    /*
+     * 0F38 5E: TDPB{SS,SU,US,UU}D, 5C: TDPBF16PS (F3) and TDPFP16PS (F2),
+     * 6C: TCMMRLFP16PS (none) and TCMMIMFP16PS (66); registers only.
+     */
     static const X86OpEntry tdpbxxd =
         X86_OP_ENTRY0(TDPBxxD,    vex_amx3 chk2(W0, o64) cpuid(AMX_INT8) p_00_66_f3_f2);
     static const X86OpEntry tdpbf16ps =
         X86_OP_ENTRY0(TDPBF16PS,  vex_amx3 chk2(W0, o64) cpuid(AMX_BF16) p_f3);
+    static const X86OpEntry tdpfp16ps =
+        X86_OP_ENTRY0(TDPFP16PS,  vex_amx3 chk2(W0, o64) cpuid(AMX_FP16) p_f2);
+    static const X86OpEntry tcmmfp16ps =
+        X86_OP_ENTRY0(TCMMxxFP16PS, vex_amx3 chk2(W0, o64) cpuid(AMX_COMPLEX) p_00_66);
 
     if ((get_modrm(s, env) >> 6) != 3) {
         *entry = UNKNOWN_OPCODE;
     } else {
-        *entry = *b == 0x5e ? tdpbxxd : tdpbf16ps;
+        switch (*b) {
+        case 0x5e:
+            *entry = tdpbxxd;
+            break;
+        case 0x6c:
+            *entry = tcmmfp16ps;
+            break;
+        default:
+            *entry = (s->prefix & PREFIX_REPNZ) ? tdpfp16ps : tdpbf16ps;
+            break;
+        }
     }
 }
 
@@ -857,6 +874,7 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x4b] = X86_OP_GROUP0(amx_ldst),
     [0x5c] = X86_OP_GROUP0(amx_tdp),
     [0x5e] = X86_OP_GROUP0(amx_tdp),
+    [0x6c] = X86_OP_GROUP0(amx_tdp),
 
     [0x90] = X86_OP_ENTRY3(VPGATHERD, V,x,  H,x,  M,d,  vex12 cpuid(AVX2) p_66), /* vpgatherdd/q */
     [0x91] = X86_OP_ENTRY3(VPGATHERQ, V,x,  H,x,  M,q,  vex12 cpuid(AVX2) p_66), /* vpgatherqd/q */
@@ -3085,6 +3103,10 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
         return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_INT8);
     case X86_FEAT_AMX_BF16:
         return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_BF16);
+    case X86_FEAT_AMX_FP16:
+        return (s->cpuid_7_1_eax_features & CPUID_7_1_EAX_AMX_FP16);
+    case X86_FEAT_AMX_COMPLEX:
+        return (s->cpuid_7_1_edx_features & CPUID_7_1_EDX_AMX_COMPLEX);
     case X86_FEAT_AMX_TILE:
         return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_TILE);
     case X86_FEAT_XSAVEC:
