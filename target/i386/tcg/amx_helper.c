@@ -21,6 +21,7 @@
 #include "exec/helper-proto.h"
 #include "helper-tcg.h"
 #include "access.h"
+#include "fpu/softfloat.h"
 
 /*
  * The tile configuration is kept in env->xtilecfg in the layout of the
@@ -249,4 +250,135 @@ void HELPER(tilestored)(CPUX86State *env, target_ulong base, target_ulong stride
         }
     }
     env->xtilecfg[1] = 0;
+}
+
+/*
+ * Check the tiles of a tile multiply.  C (@dst) is m x n dwords, A (@src1)
+ * m x k and B (@src2) k x n, so the shapes have to agree, and the three
+ * tiles have to be different.  The multiplies ignore tilecfg.start_row.
+ */
+static void tdp_check(CPUX86State *env, unsigned dst, unsigned src1,
+                      unsigned src2, uintptr_t ra)
+{
+    const uint8_t *cfg = env->xtilecfg;
+
+    amx_check(env, ra);
+    amx_check_tile(env, dst, ra);
+    amx_check_tile(env, src1, ra);
+    amx_check_tile(env, src2, ra);
+
+    if (dst == src1 || dst == src2 || src1 == src2 ||
+        tilecfg_rows(cfg, dst) != tilecfg_rows(cfg, src1) ||
+        tilecfg_colsb(cfg, src1) / 4 != tilecfg_rows(cfg, src2) ||
+        tilecfg_colsb(cfg, src1) % 4 ||
+        tilecfg_colsb(cfg, dst) != tilecfg_colsb(cfg, src2) ||
+        tilecfg_colsb(cfg, dst) % 4) {
+        raise_exception_ra(env, EXCP06_ILLOP, ra);
+    }
+    amx_check_xfd(env, ra);
+}
+
+/* Store a row of C and zero the rest of the row and the rows below.  */
+static void tdp_finish_row(uint8_t *tile, unsigned m, const uint32_t *row,
+                           unsigned dwords)
+{
+    uint8_t *dst = tile + m * AMX_MAX_COLSB;
+    unsigned n;
+
+    memset(dst, 0, AMX_MAX_COLSB);
+    for (n = 0; n < dwords; n++) {
+        stl_le_p(dst + 4 * n, row[n]);
+    }
+}
+
+static void tdp_finish(CPUX86State *env, uint8_t *tile, unsigned rows)
+{
+    memset(tile + rows * AMX_MAX_COLSB, 0, AMX_TILE_BYTES - rows * AMX_MAX_COLSB);
+    env->xtilecfg[1] = 0;
+}
+
+/* TDPB{SS,SU,US,UU}D: flags bit 0 / bit 1 say that A / B is signed.  */
+void HELPER(tdpbxxd)(CPUX86State *env, uint32_t dst, uint32_t src1,
+                     uint32_t src2, uint32_t flags)
+{
+    uintptr_t ra = GETPC();
+    uint8_t *c = env->xtiledata + dst * AMX_TILE_BYTES;
+    const uint8_t *a = env->xtiledata + src1 * AMX_TILE_BYTES;
+    const uint8_t *b = env->xtiledata + src2 * AMX_TILE_BYTES;
+    unsigned rows, kdw, ndw, m, k, n, i;
+
+    tdp_check(env, dst, src1, src2, ra);
+    rows = tilecfg_rows(env->xtilecfg, dst);
+    kdw = tilecfg_colsb(env->xtilecfg, src1) / 4;
+    ndw = tilecfg_colsb(env->xtilecfg, dst) / 4;
+
+    for (m = 0; m < rows; m++) {
+        uint32_t tmp[AMX_MAX_COLSB / 4];
+
+        for (n = 0; n < ndw; n++) {
+            tmp[n] = ldl_le_p(c + m * AMX_MAX_COLSB + 4 * n);
+        }
+        for (k = 0; k < kdw; k++) {
+            for (n = 0; n < ndw; n++) {
+                for (i = 0; i < 4; i++) {
+                    uint8_t x = a[m * AMX_MAX_COLSB + 4 * k + i];
+                    uint8_t y = b[k * AMX_MAX_COLSB + 4 * n + i];
+                    int32_t xv = (flags & 1) ? (int8_t)x : x;
+                    int32_t yv = (flags & 2) ? (int8_t)y : y;
+
+                    /* Wraps around like the hardware's 32-bit adds.  */
+                    tmp[n] += (uint32_t)(xv * yv);
+                }
+            }
+        }
+        tdp_finish_row(c, m, tmp, ndw);
+    }
+    tdp_finish(env, c, rows);
+}
+
+/* TDPBF16PS: bf16 pairs; FP32 FMAs in RNE with denormals flushed, no flags.  */
+void HELPER(tdpbf16ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
+                       uint32_t src2)
+{
+    uintptr_t ra = GETPC();
+    uint8_t *c = env->xtiledata + dst * AMX_TILE_BYTES;
+    const uint8_t *a = env->xtiledata + src1 * AMX_TILE_BYTES;
+    const uint8_t *b = env->xtiledata + src2 * AMX_TILE_BYTES;
+    float_status st = env->sse_status;
+    unsigned rows, kdw, ndw, m, k, n;
+
+    tdp_check(env, dst, src1, src2, ra);
+    rows = tilecfg_rows(env->xtilecfg, dst);
+    kdw = tilecfg_colsb(env->xtilecfg, src1) / 4;
+    ndw = tilecfg_colsb(env->xtilecfg, dst) / 4;
+
+    set_float_rounding_mode(float_round_nearest_even, &st);
+    set_flush_to_zero(true, &st);
+    set_flush_inputs_to_zero(true, &st);
+
+    for (m = 0; m < rows; m++) {
+        uint32_t tmp[AMX_MAX_COLSB / 4];
+
+        for (n = 0; n < ndw; n++) {
+            /* Even and odd bf16 elements accumulate separately.  */
+            float32 even = float32_zero, odd = float32_zero, sum, old;
+
+            for (k = 0; k < kdw; k++) {
+                const uint8_t *arow = a + m * AMX_MAX_COLSB + 4 * k;
+                const uint8_t *brow = b + k * AMX_MAX_COLSB + 4 * n;
+
+                even = float32_muladd(lduw_le_p(arow) << 16,
+                                      lduw_le_p(brow) << 16,
+                                      even, 0, &st);
+                odd = float32_muladd(lduw_le_p(arow + 2) << 16,
+                                     lduw_le_p(brow + 2) << 16,
+                                     odd, 0, &st);
+            }
+            sum = float32_add(even, odd, &st);
+            old = ldl_le_p(c + m * AMX_MAX_COLSB + 4 * n);
+            tmp[n] = float32_add(old, sum, &st);
+        }
+        tdp_finish_row(c, m, tmp, ndw);
+    }
+    tdp_finish(env, c, rows);
 }

@@ -1002,6 +1002,7 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
 #define CPUID_7_0_EDX_KERNEL_FEATURES 0
 #endif
 #define TCG_7_0_EDX_FEATURES (CPUID_7_0_EDX_FSRM | CPUID_7_0_EDX_AMX_TILE | \
+          CPUID_7_0_EDX_AMX_INT8 | CPUID_7_0_EDX_AMX_BF16 | \
           CPUID_7_0_EDX_KERNEL_FEATURES)
 
 #define TCG_7_1_EAX_FEATURES (CPUID_7_1_EAX_FZRM | CPUID_7_1_EAX_FSRS | \
@@ -1019,7 +1020,8 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
 #define TCG_SGX_12_1_EAX_FEATURES 0
 #define TCG_24_0_EBX_FEATURES 0
 #define TCG_29_0_EBX_FEATURES CPUID_29_0_EBX_APX_NCI_NDD_NF
-#define TCG_1E_1_EAX_FEATURES 0
+#define TCG_1E_1_EAX_FEATURES (CPUID_1E_1_EAX_AMX_INT8_ALIAS | \
+          CPUID_1E_1_EAX_AMX_BF16_ALIAS)
 #define TCG_24_1_ECX_FEATURES 0
 
 #if defined CONFIG_USER_ONLY

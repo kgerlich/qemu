@@ -260,6 +260,7 @@
 #define vex12 .vex_class = 12,
 #define vex13 .vex_class = 13,
 #define vex_amx .vex_class = 14,
+#define vex_amx3 .vex_class = 15,
 #define evex_apx .vex_class = X86_EVEX_APX,
 #define evex_apx_cmp .vex_class = X86_EVEX_APX_cmp,
 #define evex_apx_pp2 .vex_class = X86_EVEX_APX_pp2,
@@ -767,6 +768,21 @@ static void decode_amx_cfg(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
     *entry = UNKNOWN_OPCODE;
 }
 
+static void decode_amx_tdp(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
+{
+    /* 0F38 5E: TDPB{SS,SU,US,UU}D, 5C: TDPBF16PS; registers only.  */
+    static const X86OpEntry tdpbxxd =
+        X86_OP_ENTRY0(TDPBxxD,    vex_amx3 chk2(W0, o64) cpuid(AMX_INT8) p_00_66_f3_f2);
+    static const X86OpEntry tdpbf16ps =
+        X86_OP_ENTRY0(TDPBF16PS,  vex_amx3 chk2(W0, o64) cpuid(AMX_BF16) p_f3);
+
+    if ((get_modrm(s, env) >> 6) != 3) {
+        *entry = UNKNOWN_OPCODE;
+    } else {
+        *entry = *b == 0x5e ? tdpbxxd : tdpbf16ps;
+    }
+}
+
 static void decode_amx_ldst(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
     /* 0F38 4B: TILELOADD, TILELOADDT1, TILESTORED; SIB addressing only.  */
@@ -839,6 +855,8 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x47] = X86_OP_ENTRY3(VPSLLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
     [0x49] = X86_OP_GROUP0(amx_cfg),
     [0x4b] = X86_OP_GROUP0(amx_ldst),
+    [0x5c] = X86_OP_GROUP0(amx_tdp),
+    [0x5e] = X86_OP_GROUP0(amx_tdp),
 
     [0x90] = X86_OP_ENTRY3(VPGATHERD, V,x,  H,x,  M,d,  vex12 cpuid(AVX2) p_66), /* vpgatherdd/q */
     [0x91] = X86_OP_ENTRY3(VPGATHERQ, V,x,  H,x,  M,q,  vex12 cpuid(AVX2) p_66), /* vpgatherqd/q */
@@ -3063,6 +3081,10 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
 
     case X86_FEAT_XSAVEOPT:
         return (s->cpuid_xsave_features & CPUID_XSAVE_XSAVEOPT);
+    case X86_FEAT_AMX_INT8:
+        return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_INT8);
+    case X86_FEAT_AMX_BF16:
+        return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_BF16);
     case X86_FEAT_AMX_TILE:
         return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_TILE);
     case X86_FEAT_XSAVEC:
@@ -3255,6 +3277,12 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
             goto illegal;
         }
         break;
+    case 15:
+        /* AMX with three tile operands: VEX.vvvv names the last one.  */
+        if (!(s->prefix & PREFIX_VEX) || s->vex_l) {
+            goto illegal;
+        }
+        return true;
     case 13:
         if (!(s->prefix & (PREFIX_VEX | PREFIX_EVEX))) {
             goto illegal;
@@ -3307,7 +3335,7 @@ static bool validate_cr0_exceptions(DisasContext *s, X86DecodedInsn *decode)
         break;
     }
 
-    if (decode->e.vex_class == 14) {
+    if (decode->e.vex_class == 14 || decode->e.vex_class == 15) {
         /* AMX-E1 to E6 do not depend on CR0.TS or CR0.EM.  */
         return true;
     }

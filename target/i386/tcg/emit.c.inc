@@ -5115,6 +5115,39 @@ static void gen_TILESTORED(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_tilestored(tcg_env, s->A0, stride, gen_tmm_reg(s));
 }
 
+/* TDP*: ModRM.reg is the accumulator, ModRM.rm and VEX.vvvv the sources.  */
+static void gen_tdp_regs(DisasContext *s, TCGv_i32 *dst, TCGv_i32 *src1,
+                         TCGv_i32 *src2)
+{
+    *dst = gen_tmm_reg(s);
+    *src1 = tcg_constant_i32((s->modrm & 7) | (REX_B(s) << 3));
+    *src2 = tcg_constant_i32(s->vex_v);
+}
+
+static void gen_TDPBxxD(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i32 dst, src1, src2;
+    int flags = 0;
+
+    gen_tdp_regs(s, &dst, &src1, &src2);
+    /* F3 (SU) and F2 (SS) take a signed first source, 66 (US) and F2 a signed second one.  */
+    if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) {
+        flags |= 1;
+    }
+    if (s->prefix & (PREFIX_DATA | PREFIX_REPNZ)) {
+        flags |= 2;
+    }
+    gen_helper_tdpbxxd(tcg_env, dst, src1, src2, tcg_constant_i32(flags));
+}
+
+static void gen_TDPBF16PS(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i32 dst, src1, src2;
+
+    gen_tdp_regs(s, &dst, &src1, &src2);
+    gen_helper_tdpbf16ps(tcg_env, dst, src1, src2);
+}
+
 static void gen_XRSTORS(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();
