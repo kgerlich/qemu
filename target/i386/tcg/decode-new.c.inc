@@ -259,6 +259,7 @@
 #define vex11 .vex_class = 11,
 #define vex12 .vex_class = 12,
 #define vex13 .vex_class = 13,
+#define vex_amx .vex_class = 14,
 #define evex_apx .vex_class = X86_EVEX_APX,
 #define evex_apx_cmp .vex_class = X86_EVEX_APX_cmp,
 #define evex_apx_pp2 .vex_class = X86_EVEX_APX_pp2,
@@ -734,6 +735,63 @@ static void decode_0FD6(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
     *entry = *decode_by_prefix(s, movq);
 }
 
+static void decode_amx_cfg(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
+{
+    /* 0F38 49: LDTILECFG, STTILECFG, TILERELEASE, TILEZERO.  */
+    static const X86OpEntry ldtilecfg =
+        X86_OP_ENTRYr(LDTILECFG,  M,y, vex_amx chk2(W0, o64) cpuid(AMX_TILE) p_00);
+    static const X86OpEntry sttilecfg =
+        X86_OP_ENTRYw(STTILECFG,  M,y, vex_amx chk2(W0, o64) cpuid(AMX_TILE) p_66);
+    static const X86OpEntry tilerelease =
+        X86_OP_ENTRY0(TILERELEASE,     vex_amx chk2(W0, o64) cpuid(AMX_TILE) p_00);
+    static const X86OpEntry tilezero =
+        X86_OP_ENTRY0(TILEZERO,        vex_amx chk2(W0, o64) cpuid(AMX_TILE) p_f2);
+
+    uint8_t modrm = get_modrm(s, env);
+    int reg = (modrm >> 3) & 7;
+
+    if ((modrm >> 6) != 3) {
+        if (reg == 0) {
+            *entry = (s->prefix & PREFIX_DATA) ? sttilecfg : ldtilecfg;
+            return;
+        }
+    } else if (s->prefix & PREFIX_REPNZ) {
+        if ((modrm & 7) == 0) {
+            *entry = tilezero;
+            return;
+        }
+    } else if (modrm == 0xc0) {
+        *entry = tilerelease;
+        return;
+    }
+    *entry = UNKNOWN_OPCODE;
+}
+
+static void decode_amx_ldst(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
+{
+    /* 0F38 4B: TILELOADD, TILELOADDT1, TILESTORED; SIB addressing only.  */
+    static const X86OpEntry tileloadd =
+        X86_OP_ENTRYr(TILELOADD,   M,y, vex_amx chk2(W0, o64) cpuid(AMX_TILE) p_f2);
+    static const X86OpEntry tileloaddt1 =
+        X86_OP_ENTRYr(TILELOADD,   M,y, vex_amx chk2(W0, o64) cpuid(AMX_TILE) p_66);
+    static const X86OpEntry tilestored =
+        X86_OP_ENTRYw(TILESTORED,  M,y, vex_amx chk2(W0, o64) cpuid(AMX_TILE) p_f3);
+
+    uint8_t modrm = get_modrm(s, env);
+
+    if ((modrm >> 6) == 3 || (modrm & 7) != 4 || s->aflag == MO_16) {
+        *entry = UNKNOWN_OPCODE;
+    } else if (s->prefix & PREFIX_REPNZ) {
+        *entry = tileloadd;
+    } else if (s->prefix & PREFIX_DATA) {
+        *entry = tileloaddt1;
+    } else if (s->prefix & PREFIX_REPZ) {
+        *entry = tilestored;
+    } else {
+        *entry = UNKNOWN_OPCODE;
+    }
+}
+
 static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x00] = X86_OP_ENTRY3(PSHUFB,    V,x,  H,x,   W,x,  vex4 cpuid(SSSE3) mmx avx2_256 p_00_66),
     [0x01] = X86_OP_ENTRY3(PHADDW,    V,x,  H,x,   W,x,  vex4 cpuid(SSSE3) mmx avx2_256 p_00_66),
@@ -779,6 +837,8 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x45] = X86_OP_ENTRY3(VPSRLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
     [0x46] = X86_OP_ENTRY3(VPSRAV,      V,x,  H,x,       W,x,  vex6 chk(W0) cpuid(AVX2) p_66),
     [0x47] = X86_OP_ENTRY3(VPSLLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
+    [0x49] = X86_OP_GROUP0(amx_cfg),
+    [0x4b] = X86_OP_GROUP0(amx_ldst),
 
     [0x90] = X86_OP_ENTRY3(VPGATHERD, V,x,  H,x,  M,d,  vex12 cpuid(AVX2) p_66), /* vpgatherdd/q */
     [0x91] = X86_OP_ENTRY3(VPGATHERQ, V,x,  H,x,  M,q,  vex12 cpuid(AVX2) p_66), /* vpgatherqd/q */
@@ -3003,6 +3063,8 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
 
     case X86_FEAT_XSAVEOPT:
         return (s->cpuid_xsave_features & CPUID_XSAVE_XSAVEOPT);
+    case X86_FEAT_AMX_TILE:
+        return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_TILE);
     case X86_FEAT_XSAVEC:
         return (s->cpuid_xsave_features & CPUID_XSAVE_XSAVEC);
     case X86_FEAT_XSAVES:
@@ -3187,6 +3249,12 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
             goto illegal;
         }
         break;
+    case 14:
+        /* AMX: VEX.128 only, and VEX.vvvv unused (checked below).  */
+        if (!(s->prefix & PREFIX_VEX) || s->vex_l) {
+            goto illegal;
+        }
+        break;
     case 13:
         if (!(s->prefix & (PREFIX_VEX | PREFIX_EVEX))) {
             goto illegal;
@@ -3239,6 +3307,10 @@ static bool validate_cr0_exceptions(DisasContext *s, X86DecodedInsn *decode)
         break;
     }
 
+    if (decode->e.vex_class == 14) {
+        /* AMX-E1 to E6 do not depend on CR0.TS or CR0.EM.  */
+        return true;
+    }
     if (s->flags & HF_TS_MASK) {
         gen_NM_exception(s);
         return false;

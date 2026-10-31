@@ -28,6 +28,7 @@
 #include "fpu/softfloat-macros.h"
 #include "helper-tcg.h"
 #include "access.h"
+#include "exec/target_page.h"
 
 /* float macros */
 #define FT0    (env->ft0)
@@ -2738,10 +2739,17 @@ static void do_xsave_xtilecfg(X86Access *ac, target_ulong ptr)
 static void do_xsave_xtiledata(X86Access *ac, target_ulong ptr)
 {
     CPUX86State *env = ac->env;
-    int i;
+    int i, j;
 
-    for (i = 0; i < sizeof(env->xtiledata); i += 8) {
-        access_stq(ac, ptr + i, ldq_le_p(env->xtiledata + i));
+    /* 8 KB does not fit one X86Access, so go 1 KB at a time.  */
+    for (i = 0; i < sizeof(env->xtiledata); i += 1024) {
+        X86Access sub;
+
+        access_prepare_mmu(&sub, env, ptr + i, 1024, MMU_DATA_STORE,
+                           ac->mmu_idx, ac->ra);
+        for (j = 0; j < 1024; j += 8) {
+            access_stq(&sub, ptr + i + j, ldq_le_p(env->xtiledata + i + j));
+        }
     }
 }
 
@@ -2831,6 +2839,33 @@ static target_ulong xsave_comp_off(int bit, uint64_t layout)
     g_assert_not_reached();
 }
 
+/*
+ * An X86Access covers at most a page, so it cannot reach every component of
+ * a large XSAVE area.  Return @ac if it covers [@addr, @addr + @len), else
+ * prepare @sub for that range.
+ */
+static X86Access *comp_access(X86Access *ac, X86Access *sub, target_ulong addr,
+                              unsigned len, MMUAccessType type)
+{
+    if (addr >= ac->vaddr && addr + len - ac->vaddr <= ac->size) {
+        return ac;
+    }
+    access_prepare_mmu(sub, ac->env, addr, len, type, ac->mmu_idx, ac->ra);
+    return sub;
+}
+
+/* Fault in the tile data now, before any state is changed.  */
+static void probe_xtiledata(CPUX86State *env, target_ulong addr,
+                            MMUAccessType type, uintptr_t ra)
+{
+    X86Access ac;
+    int i;
+
+    for (i = 0; i < sizeof(env->xtiledata); i += 2048) {
+        access_prepare(&ac, env, addr + i, 2048, type, ra);
+    }
+}
+
 static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
                             uint64_t inuse, uint64_t opt, uint64_t layout)
 {
@@ -2860,11 +2895,19 @@ static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
     }
 #ifdef TARGET_X86_64
     if (opt & XSTATE_APX_MASK) {
-        do_xsave_apx(ac, ptr + xsave_comp_off(XSTATE_APX_BIT, layout));
+        target_ulong off = ptr + xsave_comp_off(XSTATE_APX_BIT, layout);
+        X86Access sub;
+
+        do_xsave_apx(comp_access(ac, &sub, off, sizeof(XSaveAPX),
+                                 MMU_DATA_STORE), off);
     }
 #endif
     if (opt & XSTATE_XTILE_CFG_MASK) {
-        do_xsave_xtilecfg(ac, ptr + xsave_comp_off(XSTATE_XTILE_CFG_BIT, layout));
+        target_ulong off = ptr + xsave_comp_off(XSTATE_XTILE_CFG_BIT, layout);
+        X86Access sub;
+
+        do_xsave_xtilecfg(comp_access(ac, &sub, off, sizeof(XSaveXTILECFG),
+                                      MMU_DATA_STORE), off);
     }
     if (opt & XSTATE_XTILE_DATA_MASK) {
         do_xsave_xtiledata(ac, ptr + xsave_comp_off(XSTATE_XTILE_DATA_BIT, layout));
@@ -2914,7 +2957,12 @@ static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     opt &= rfbm;
     size = xsave_area_size(opt, false);
 
-    access_prepare(&ac, env, ptr, size, MMU_DATA_STORE, ra);
+    if (opt & XSTATE_XTILE_DATA_MASK) {
+        probe_xtiledata(env, ptr + xsave_comp_off(XSTATE_XTILE_DATA_BIT, 0),
+                        MMU_DATA_STORE, ra);
+    }
+    access_prepare(&ac, env, ptr, MIN(size, TARGET_PAGE_SIZE),
+                   MMU_DATA_STORE, ra);
     do_xsave_access(&ac, ptr, rfbm, inuse, opt, 0);
 }
 
@@ -2933,7 +2981,12 @@ static void do_xsavec(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
 
     rfbm &= enabled;
     layout = rfbm | XCOMP_BV_COMPACTED;
-    access_prepare(&ac, env, ptr, xsave_area_size(rfbm, true),
+    if (rfbm & get_xinuse(env) & XSTATE_XTILE_DATA_MASK) {
+        probe_xtiledata(env, ptr + xsave_comp_off(XSTATE_XTILE_DATA_BIT, layout),
+                        MMU_DATA_STORE, ra);
+    }
+    access_prepare(&ac, env, ptr, MIN(xsave_area_size(rfbm, true),
+                                      TARGET_PAGE_SIZE),
                    MMU_DATA_STORE, ra);
     do_xsave_access(&ac, ptr, rfbm, get_xinuse(env), get_xinuse(env) & rfbm,
                     layout);
@@ -3128,34 +3181,6 @@ static void do_clear_apx(X86Access *ac)
 }
 #endif
 
-/*
- * A tile configuration is valid if it names palette 0 (no tiles) or palette 1
- * with tiles no larger than the palette allows, and has no reserved bits set.
- */
-static bool valid_xtilecfg(const uint8_t *cfg)
-{
-    int i;
-
-    if (cfg[0] > 1 || cfg[1] != 0) {
-        return false;
-    }
-    for (i = 2; i < 16; i++) {
-        if (cfg[i]) {
-            return false;
-        }
-    }
-    for (i = 0; i < 16; i++) {
-        uint16_t colsb = lduw_le_p(cfg + 16 + 2 * i);
-        uint8_t rows = cfg[48 + i];
-
-        if (cfg[0] == 0 ? (colsb || rows) :
-            (i >= 8 ? (colsb || rows) : (colsb > 64 || rows > 16))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static void do_xrstor_xtilecfg(X86Access *ac, target_ulong ptr)
 {
     CPUX86State *env = ac->env;
@@ -3164,15 +3189,25 @@ static void do_xrstor_xtilecfg(X86Access *ac, target_ulong ptr)
     for (i = 0; i < sizeof(env->xtilecfg); i += 8) {
         stq_le_p(env->xtilecfg + i, access_ldq(ac, ptr + i));
     }
+    /* Palette 0 is the initial state, whatever else the image holds.  */
+    if (env->xtilecfg[0] == 0) {
+        memset(env->xtilecfg, 0, sizeof(env->xtilecfg));
+    }
 }
 
 static void do_xrstor_xtiledata(X86Access *ac, target_ulong ptr)
 {
     CPUX86State *env = ac->env;
-    int i;
+    int i, j;
 
-    for (i = 0; i < sizeof(env->xtiledata); i += 8) {
-        stq_le_p(env->xtiledata + i, access_ldq(ac, ptr + i));
+    for (i = 0; i < sizeof(env->xtiledata); i += 1024) {
+        X86Access sub;
+
+        access_prepare_mmu(&sub, env, ptr + i, 1024, MMU_DATA_LOAD,
+                           ac->mmu_idx, ac->ra);
+        for (j = 0; j < 1024; j += 8) {
+            stq_le_p(env->xtiledata + i + j, access_ldq(&sub, ptr + i + j));
+        }
     }
 }
 
@@ -3311,7 +3346,11 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
 #ifdef TARGET_X86_64
     if (rfbm & XSTATE_APX_MASK) {
         if (xstate_bv & XSTATE_APX_MASK) {
-            do_xrstor_apx(ac, ptr + xsave_comp_off(XSTATE_APX_BIT, layout));
+            target_ulong off = ptr + xsave_comp_off(XSTATE_APX_BIT, layout);
+            X86Access sub;
+
+            do_xrstor_apx(comp_access(ac, &sub, off, sizeof(XSaveAPX),
+                                      MMU_DATA_LOAD), off);
         } else {
             do_clear_apx(ac);
         }
@@ -3319,7 +3358,11 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
 #endif
     if (rfbm & XSTATE_XTILE_CFG_MASK) {
         if (xstate_bv & XSTATE_XTILE_CFG_MASK) {
-            do_xrstor_xtilecfg(ac, ptr + xsave_comp_off(XSTATE_XTILE_CFG_BIT, layout));
+            target_ulong off = ptr + xsave_comp_off(XSTATE_XTILE_CFG_BIT, layout);
+            X86Access sub;
+
+            do_xrstor_xtilecfg(comp_access(ac, &sub, off, sizeof(XSaveXTILECFG),
+                                           MMU_DATA_LOAD), off);
         } else {
             memset(env->xtilecfg, 0, sizeof(env->xtilecfg));
         }
@@ -3369,6 +3412,12 @@ static void do_xrstor_insn(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     } else {
         size_ext = xsave_area_size(rfbm & xstate_bv, false);
     }
+    if (rfbm & xstate_bv & XSTATE_XTILE_DATA_MASK) {
+        probe_xtiledata(env, ptr + xsave_comp_off(XSTATE_XTILE_DATA_BIT,
+                                                  xcomp_bv),
+                        MMU_DATA_LOAD, ra);
+    }
+    size_ext = MIN(size_ext, TARGET_PAGE_SIZE);
     if (size < size_ext) {
         /* TODO: See if existing page probe has covered extra size. */
         access_prepare(&ac, env, ptr, size_ext, MMU_DATA_LOAD, ra);
@@ -3383,7 +3432,7 @@ static void do_xrstor_insn(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
             stq_le_p(cfg + i, access_ldq(&ac, ptr +
                      xsave_comp_off(XSTATE_XTILE_CFG_BIT, xcomp_bv) + i));
         }
-        if (!valid_xtilecfg(cfg)) {
+        if (!x86_tilecfg_valid(cfg, true)) {
             raise_exception_ra(env, EXCP0D_GPF, ra);
         }
     }

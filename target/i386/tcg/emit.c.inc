@@ -5050,6 +5050,71 @@ static void gen_XRSTOR(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+static void gen_LDTILECFG(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_helper_ldtilecfg(tcg_env, s->A0);
+}
+
+static void gen_STTILECFG(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_helper_sttilecfg(tcg_env, s->A0);
+}
+
+static void gen_TILERELEASE(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_helper_tilerelease(tcg_env);
+}
+
+/* The tile number is ModRM.reg, extended by VEX.R, which must stay zero.  */
+static TCGv_i32 gen_tmm_reg(DisasContext *s)
+{
+    return tcg_constant_i32(((s->modrm >> 3) & 7) | (REX_R(s) << 3));
+}
+
+static void gen_TILEZERO(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_helper_tilezero(tcg_env, gen_tmm_reg(s));
+}
+
+/*
+ * Tile loads and stores take base+disp as the address and the index register,
+ * scaled, as the stride between rows.  The decoder has already folded the
+ * index into A0, so recompute the address without it.
+ */
+static void gen_tile_addr(DisasContext *s, X86DecodedInsn *decode, TCGv stride)
+{
+    AddressParts a = decode->mem;
+    TCGv ea;
+
+    if (a.index >= 0) {
+        tcg_gen_shli_tl(stride, cpu_regs[a.index], a.scale);
+        if (s->aflag == MO_32) {
+            tcg_gen_ext32u_tl(stride, stride);
+        }
+    } else {
+        tcg_gen_movi_tl(stride, 0);
+    }
+    a.index = -1;
+    ea = gen_lea_modrm_1(s, a, false);
+    gen_lea_v_seg(s, ea, a.def_seg, s->override);
+}
+
+static void gen_TILELOADD(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv stride = tcg_temp_new();
+
+    gen_tile_addr(s, decode, stride);
+    gen_helper_tileloadd(tcg_env, s->A0, stride, gen_tmm_reg(s));
+}
+
+static void gen_TILESTORED(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv stride = tcg_temp_new();
+
+    gen_tile_addr(s, decode, stride);
+    gen_helper_tilestored(tcg_env, s->A0, stride, gen_tmm_reg(s));
+}
+
 static void gen_XRSTORS(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();

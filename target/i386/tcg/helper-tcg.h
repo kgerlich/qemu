@@ -127,4 +127,7 @@ static inline void do_end_instruction(CPUX86State *env)
     env->hflags &= ~HF_INHIBIT_IRQ_MASK;
     env->eflags &= ~HF_RF_MASK;
 }
+/* amx_helper.c */
+bool x86_tilecfg_valid(const uint8_t *cfg, bool restore);
+
 #endif /* I386_HELPER_TCG_H */
