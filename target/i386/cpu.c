@@ -1010,9 +1010,8 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
 #define TCG_7_2_EDX_FEATURES 0
 #define TCG_APM_FEATURES 0
 #define TCG_6_EAX_FEATURES CPUID_6_EAX_ARAT
-#define TCG_XSAVE_FEATURES (CPUID_XSAVE_XSAVEOPT | CPUID_XSAVE_XGETBV1)
-          /* missing:
-          CPUID_XSAVE_XSAVEC, CPUID_XSAVE_XSAVES */
+#define TCG_XSAVE_FEATURES (CPUID_XSAVE_XSAVEOPT | CPUID_XSAVE_XSAVEC | \
+          CPUID_XSAVE_XGETBV1 | CPUID_XSAVE_XSAVES)
 #define TCG_14_0_ECX_FEATURES 0
 #define TCG_SGX_12_0_EAX_FEATURES 0
 #define TCG_SGX_12_0_EBX_FEATURES 0
@@ -2182,7 +2181,12 @@ uint32_t xsave_area_size(uint64_t mask, bool compacted)
     for (i = 2; i < ARRAY_SIZE(x86_ext_save_areas); i++) {
         esa = &x86_ext_save_areas[i];
         if ((mask >> i) & 1) {
-            offset = compacted ? ret : esa->offset;
+            if (compacted) {
+                offset = (esa->ecx & ESA_FEATURE_ALIGN64_MASK) ?
+                         ROUND_UP(ret, 64) : ret;
+            } else {
+                offset = esa->offset;
+            }
             ret = MAX(ret, offset + esa->size);
         }
     }

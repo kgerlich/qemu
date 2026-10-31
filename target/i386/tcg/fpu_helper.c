@@ -2770,8 +2770,40 @@ static uint64_t get_xinuse(CPUX86State *env)
     return inuse;
 }
 
+#define XCOMP_BV_COMPACTED  (1ULL << 63)
+
+/*
+ * Offset of extended state component @bit.  @layout is zero for the standard
+ * format; otherwise it is the XCOMP_BV of the compacted format, which packs
+ * the components it names right after the header.
+ */
+static target_ulong xsave_comp_off(int bit, uint64_t layout)
+{
+    const ExtSaveArea *esa;
+    uint32_t off = sizeof(X86LegacyXSaveArea) + sizeof(X86XSaveHeader);
+    int i;
+
+    if (!(layout & XCOMP_BV_COMPACTED)) {
+        return x86_ext_save_areas[bit].offset;
+    }
+    for (i = 2; i <= bit; i++) {
+        if (!((layout >> i) & 1)) {
+            continue;
+        }
+        esa = &x86_ext_save_areas[i];
+        if (esa->ecx & ESA_FEATURE_ALIGN64_MASK) {
+            off = ROUND_UP(off, 64);
+        }
+        if (i == bit) {
+            return off;
+        }
+        off += esa->size;
+    }
+    g_assert_not_reached();
+}
+
 static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
-                            uint64_t inuse, uint64_t opt)
+                            uint64_t inuse, uint64_t opt, uint64_t layout)
 {
     uint64_t old_bv, new_bv;
 
@@ -2786,22 +2818,34 @@ static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
         do_xsave_sse(ac, ptr);
     }
     if (opt & XSTATE_YMM_MASK) {
-        do_xsave_ymmh(ac, ptr + XO(avx_state));
+        do_xsave_ymmh(ac, ptr + xsave_comp_off(XSTATE_YMM_BIT, layout));
     }
     if (opt & XSTATE_BNDREGS_MASK) {
-        do_xsave_bndregs(ac, ptr + XO(mpx_state.bndreg));
+        do_xsave_bndregs(ac, ptr + xsave_comp_off(XSTATE_BNDREGS_BIT, layout));
     }
     if (opt & XSTATE_BNDCSR_MASK) {
-        do_xsave_bndcsr(ac, ptr + XO(mpx_state.bndcsr));
+        do_xsave_bndcsr(ac, ptr + xsave_comp_off(XSTATE_BNDCSR_BIT, layout));
     }
     if (opt & XSTATE_PKRU_MASK) {
-        do_xsave_pkru(ac, ptr + XO(pkru_state));
+        do_xsave_pkru(ac, ptr + xsave_comp_off(XSTATE_PKRU_BIT, layout));
     }
 #ifdef TARGET_X86_64
     if (opt & XSTATE_APX_MASK) {
-        do_xsave_apx(ac, ptr + XO(apx_state));
+        do_xsave_apx(ac, ptr + xsave_comp_off(XSTATE_APX_BIT, layout));
     }
 #endif
+
+    if (layout & XCOMP_BV_COMPACTED) {
+        /* The compacted header is written afresh, reserved bytes zeroed.  */
+        int i;
+
+        access_stq(ac, ptr + XO(header.xstate_bv), inuse & rfbm);
+        access_stq(ac, ptr + XO(header.xcomp_bv), layout);
+        for (i = 16; i < sizeof(X86XSaveHeader); i += 8) {
+            access_stq(ac, ptr + XO(header) + i, 0);
+        }
+        return;
+    }
 
     /* Update the XSTATE_BV field.  */
     old_bv = access_ldq(ac, ptr + XO(header.xstate_bv));
@@ -2836,7 +2880,38 @@ static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     size = xsave_area_size(opt, false);
 
     access_prepare(&ac, env, ptr, size, MMU_DATA_STORE, ra);
-    do_xsave_access(&ac, ptr, rfbm, inuse, opt);
+    do_xsave_access(&ac, ptr, rfbm, inuse, opt, 0);
+}
+
+/*
+ * XSAVEC and XSAVES: compacted format, which always skips components in
+ * their initial state.  No component is supervisor-only yet, so XSAVES
+ * differs from XSAVEC only in being privileged.
+ */
+static void do_xsavec(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                      uint64_t enabled, uintptr_t ra)
+{
+    X86Access ac;
+    uint64_t layout;
+
+    do_xsave_chk(env, ptr, ra);
+
+    rfbm &= enabled;
+    layout = rfbm | XCOMP_BV_COMPACTED;
+    access_prepare(&ac, env, ptr, xsave_area_size(rfbm, true),
+                   MMU_DATA_STORE, ra);
+    do_xsave_access(&ac, ptr, rfbm, get_xinuse(env), get_xinuse(env) & rfbm,
+                    layout);
+}
+
+void HELPER(xsavec)(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+{
+    do_xsavec(env, ptr, rfbm, env->xcr0, GETPC());
+}
+
+void HELPER(xsaves)(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+{
+    do_xsavec(env, ptr, rfbm, env->xcr0 | env->xss, GETPC());
 }
 
 void HELPER(xsave)(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
@@ -3033,19 +3108,53 @@ void HELPER(fxrstor)(CPUX86State *env, target_ulong ptr)
     do_fxrstor(&ac, ptr);
 }
 
+/*
+ * Validate the XSAVE header at @ptr.  On success *pxsbv is XSTATE_BV and
+ * *pxcbv is XCOMP_BV: zero for the standard format, else the layout of the
+ * compacted format with its flag bit set.  @enabled is what the instruction
+ * may restore (XCR0, plus XSS for XRSTORS); @compact_only is XRSTORS.
+ */
 static bool valid_xrstor_header(X86Access *ac, uint64_t *pxsbv,
-                                target_ulong ptr)
+                                uint64_t *pxcbv, target_ulong ptr,
+                                uint64_t enabled, bool compact_only)
 {
     uint64_t xstate_bv, xcomp_bv, reserve0;
+    bool xsavec = ac->env->features[FEAT_XSAVE] & CPUID_XSAVE_XSAVEC;
+    int i;
 
     xstate_bv = access_ldq(ac, ptr + XO(header.xstate_bv));
     xcomp_bv = access_ldq(ac, ptr + XO(header.xcomp_bv));
     reserve0 = access_ldq(ac, ptr + XO(header.reserve0));
     *pxsbv = xstate_bv;
+    *pxcbv = xcomp_bv;
+
+    if (xcomp_bv & XCOMP_BV_COMPACTED) {
+        if (!xsavec) {
+            return false;
+        }
+        /* The layout may only name components that can be restored.  */
+        if ((xcomp_bv & ~XCOMP_BV_COMPACTED) & ~enabled) {
+            return false;
+        }
+        /* XSTATE_BV must be a subset of the layout.  */
+        if (xstate_bv & ~xcomp_bv) {
+            return false;
+        }
+        /* The reserved bytes 63:16 must be zero.  */
+        for (i = 16 + 8; i < sizeof(X86XSaveHeader); i += 8) {
+            if (access_ldq(ac, ptr + XO(header) + i)) {
+                return false;
+            }
+        }
+        return reserve0 == 0;
+    }
+
+    /* Only XRSTORS insists on the compacted form.  */
+    if (compact_only) {
+        return false;
+    }
 
     /*
-     * XCOMP_BV bit 63 indicates compact form, which we do not support,
-     * and thus must raise #GP.  That leaves us in standard form.
      * In standard form, bytes 23:8 must be zero -- which is both
      * XCOMP_BV and the following 64-bit field.
      */
@@ -3058,7 +3167,7 @@ static bool valid_xrstor_header(X86Access *ac, uint64_t *pxsbv,
 }
 
 static void do_xrstor(X86Access *ac, target_ulong ptr,
-                      uint64_t rfbm, uint64_t xstate_bv)
+                      uint64_t rfbm, uint64_t xstate_bv, uint64_t layout)
 {
     CPUX86State *env = ac->env;
 
@@ -3082,14 +3191,14 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
     }
     if (rfbm & XSTATE_YMM_MASK) {
         if (xstate_bv & XSTATE_YMM_MASK) {
-            do_xrstor_ymmh(ac, ptr + XO(avx_state));
+            do_xrstor_ymmh(ac, ptr + xsave_comp_off(XSTATE_YMM_BIT, layout));
         } else {
             do_clear_ymmh(env);
         }
     }
     if (rfbm & XSTATE_BNDREGS_MASK) {
         if (xstate_bv & XSTATE_BNDREGS_MASK) {
-            do_xrstor_bndregs(ac, ptr + XO(mpx_state.bndreg));
+            do_xrstor_bndregs(ac, ptr + xsave_comp_off(XSTATE_BNDREGS_BIT, layout));
             env->hflags |= HF_MPX_IU_MASK;
         } else {
             memset(env->bnd_regs, 0, sizeof(env->bnd_regs));
@@ -3098,7 +3207,7 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
     }
     if (rfbm & XSTATE_BNDCSR_MASK) {
         if (xstate_bv & XSTATE_BNDCSR_MASK) {
-            do_xrstor_bndcsr(ac, ptr + XO(mpx_state.bndcsr));
+            do_xrstor_bndcsr(ac, ptr + xsave_comp_off(XSTATE_BNDCSR_BIT, layout));
         } else {
             memset(&env->bndcs_regs, 0, sizeof(env->bndcs_regs));
         }
@@ -3107,7 +3216,7 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
     if (rfbm & XSTATE_PKRU_MASK) {
         uint64_t old_pkru = env->pkru;
         if (xstate_bv & XSTATE_PKRU_MASK) {
-            do_xrstor_pkru(ac, ptr + XO(pkru_state));
+            do_xrstor_pkru(ac, ptr + xsave_comp_off(XSTATE_PKRU_BIT, layout));
         } else {
             env->pkru = 0;
         }
@@ -3119,7 +3228,7 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
 #ifdef TARGET_X86_64
     if (rfbm & XSTATE_APX_MASK) {
         if (xstate_bv & XSTATE_APX_MASK) {
-            do_xrstor_apx(ac, ptr + XO(apx_state));
+            do_xrstor_apx(ac, ptr + xsave_comp_off(XSTATE_APX_BIT, layout));
         } else {
             do_clear_apx(ac);
         }
@@ -3129,11 +3238,11 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
 
 #undef XO
 
-void HELPER(xrstor)(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+static void do_xrstor_insn(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                           uint64_t enabled, bool compact_only, uintptr_t ra)
 {
-    uintptr_t ra = GETPC();
     X86Access ac;
-    uint64_t xstate_bv;
+    uint64_t xstate_bv, xcomp_bv;
     unsigned size, size_ext;
 
     do_xsave_chk(env, ptr, ra);
@@ -3141,18 +3250,34 @@ void HELPER(xrstor)(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
     /* Begin with just the minimum size to validate the header. */
     size = sizeof(X86LegacyXSaveArea) + sizeof(X86XSaveHeader);
     access_prepare(&ac, env, ptr, size, MMU_DATA_LOAD, ra);
-    if (!valid_xrstor_header(&ac, &xstate_bv, ptr)) {
+    if (!valid_xrstor_header(&ac, &xstate_bv, &xcomp_bv, ptr, enabled,
+                             compact_only)) {
         raise_exception_ra(env, EXCP0D_GPF, ra);
     }
 
-    rfbm &= env->xcr0;
-    size_ext = xsave_area_size(rfbm & xstate_bv, false);
+    rfbm &= enabled;
+
+    if (xcomp_bv) {
+        size_ext = xsave_area_size(xcomp_bv & ~XCOMP_BV_COMPACTED, true);
+    } else {
+        size_ext = xsave_area_size(rfbm & xstate_bv, false);
+    }
     if (size < size_ext) {
         /* TODO: See if existing page probe has covered extra size. */
         access_prepare(&ac, env, ptr, size_ext, MMU_DATA_LOAD, ra);
     }
 
-    do_xrstor(&ac, ptr, rfbm, xstate_bv);
+    do_xrstor(&ac, ptr, rfbm, xstate_bv, xcomp_bv);
+}
+
+void HELPER(xrstor)(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+{
+    do_xrstor_insn(env, ptr, rfbm, env->xcr0, false, GETPC());
+}
+
+void HELPER(xrstors)(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+{
+    do_xrstor_insn(env, ptr, rfbm, env->xcr0 | env->xss, true, GETPC());
 }
 
 #if defined(CONFIG_USER_ONLY)
@@ -3224,7 +3349,7 @@ void cpu_x86_xsave(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
     assert((rfbm & ~env->xcr0) == 0);
     ac.size = xsave_area_size(rfbm, false);
     assert(ac.size <= len);
-    do_xsave_access(&ac, 0, rfbm, get_xinuse(env), rfbm);
+    do_xsave_access(&ac, 0, rfbm, get_xinuse(env), rfbm, 0);
 }
 
 bool cpu_x86_xrstor(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
@@ -3233,7 +3358,7 @@ bool cpu_x86_xrstor(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
         .haddr1 = host,
         .env = env,
     };
-    uint64_t xstate_bv;
+    uint64_t xstate_bv, xcomp_bv;
 
     /*
      * Since this is only called from user-level signal handling,
@@ -3243,10 +3368,12 @@ bool cpu_x86_xrstor(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
     ac.size = xsave_area_size(rfbm, false);
     assert(ac.size <= len);
 
-    if (!valid_xrstor_header(&ac, &xstate_bv, 0)) {
+    /* Signal frames use the standard format.  */
+    if (!valid_xrstor_header(&ac, &xstate_bv, &xcomp_bv, 0, env->xcr0, false)
+        || xcomp_bv) {
         return false;
     }
-    do_xrstor(&ac, 0, rfbm, xstate_bv);
+    do_xrstor(&ac, 0, rfbm, xstate_bv, 0);
     return true;
 }
 #endif

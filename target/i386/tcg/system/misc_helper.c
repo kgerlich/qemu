@@ -203,6 +203,17 @@ void HELPER(wrmsr)(CPUX86State *env)
         env->pkrs = val;
         tlb_flush(cs);
         break;
+    case MSR_IA32_XSS: {
+        uint64_t supported = ((uint64_t)env->features[FEAT_XSAVE_XSS_HI] << 32) |
+                             env->features[FEAT_XSAVE_XSS_LO];
+
+        if (!(env->features[FEAT_XSAVE] & CPUID_XSAVE_XSAVES) ||
+            (val & ~supported)) {
+            goto error;
+        }
+        env->xss = val;
+        break;
+    }
     case MSR_VM_HSAVE_PA:
         if (val & (0xfff | ((~0ULL) << env_archcpu(env)->phys_bits))) {
             goto error;
@@ -358,6 +369,12 @@ void HELPER(rdmsr)(CPUX86State *env)
         break;
     case MSR_IA32_PKRS:
         val = env->pkrs;
+        break;
+    case MSR_IA32_XSS:
+        if (!(env->features[FEAT_XSAVE] & CPUID_XSAVE_XSAVES)) {
+            raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+        }
+        val = env->xss;
         break;
     case MSR_VM_HSAVE_PA:
         val = env->vm_hsave;
