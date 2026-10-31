@@ -639,3 +639,53 @@ void HELPER(tdpxf8ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
     }
     tdp_finish(env, c, rows);
 }
+
+/* TF32: an FP32 with the low 13 mantissa bits cleared, after quieting SNaNs.  */
+static float32 tf32_in(uint32_t v)
+{
+    if ((v & 0x7f800000) == 0x7f800000 && (v & 0x7fffff)) {
+        v |= 0x400000;
+    }
+    return make_float32(v & ~0x1fffu);
+}
+
+/*
+ * TMMULTF32PS: products of TF32 values accumulate over k in one FP32 lane per
+ * result, which is then added to the accumulator.  The description says input
+ * denormals are not treated as zero and output denormals are flushed.
+ */
+void HELPER(tmmultf32ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
+                         uint32_t src2)
+{
+    uintptr_t ra = GETPC();
+    uint8_t *c = env->xtiledata + dst * AMX_TILE_BYTES;
+    const uint8_t *a = env->xtiledata + src1 * AMX_TILE_BYTES;
+    const uint8_t *b = env->xtiledata + src2 * AMX_TILE_BYTES;
+    float_status st = amx_fp_status(env);
+    unsigned rows, kdw, ndw, m, k, n;
+
+    set_flush_inputs_to_zero(false, &st);
+    tdp_check(env, dst, src1, src2, ra);
+    rows = tilecfg_rows(env->xtilecfg, dst);
+    kdw = tilecfg_colsb(env->xtilecfg, src1) / 4;
+    ndw = tilecfg_colsb(env->xtilecfg, dst) / 4;
+
+    for (m = 0; m < rows; m++) {
+        uint32_t tmp[AMX_MAX_COLSB / 4];
+
+        for (n = 0; n < ndw; n++) {
+            float32 acc = float32_zero;
+
+            for (k = 0; k < kdw; k++) {
+                acc = float32_muladd(
+                    tf32_in(ldl_le_p(a + m * AMX_MAX_COLSB + 4 * k)),
+                    tf32_in(ldl_le_p(b + k * AMX_MAX_COLSB + 4 * n)),
+                    acc, 0, &st);
+            }
+            tmp[n] = float32_add(ldl_le_p(c + m * AMX_MAX_COLSB + 4 * n),
+                                 acc, &st);
+        }
+        tdp_finish_row(c, m, tmp, ndw);
+    }
+    tdp_finish(env, c, rows);
+}

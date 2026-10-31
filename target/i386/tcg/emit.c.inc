@@ -5166,6 +5166,14 @@ static void gen_TCMMxxFP16PS(DisasContext *s, X86DecodedInsn *decode)
                           tcg_constant_i32((s->prefix & PREFIX_DATA) != 0));
 }
 
+static void gen_TMMULTF32PS(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i32 dst, src1, src2;
+
+    gen_tdp_regs(s, &dst, &src1, &src2);
+    gen_helper_tmmultf32ps(tcg_env, dst, src1, src2);
+}
+
 /* NP: bf8 x bf8, 66: hf8 x hf8, F3: hf8 x bf8, F2: bf8 x hf8.  */
 static void gen_TDPxF8PS(DisasContext *s, X86DecodedInsn *decode)
 {

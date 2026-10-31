@@ -772,7 +772,8 @@ static void decode_amx_tdp(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
 {
     /*
      * 0F38 5E: TDPB{SS,SU,US,UU}D, 5C: TDPBF16PS (F3) and TDPFP16PS (F2),
-     * 6C: TCMMRLFP16PS (none) and TCMMIMFP16PS (66); registers only.
+     * 6C: TCMMRLFP16PS (none) and TCMMIMFP16PS (66), 48: TMMULTF32PS (66);
+     * registers only.
      */
     static const X86OpEntry tdpbxxd =
         X86_OP_ENTRY0(TDPBxxD,    vex_amx3 chk2(W0, o64) cpuid(AMX_INT8) p_00_66_f3_f2);
@@ -780,6 +781,8 @@ static void decode_amx_tdp(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         X86_OP_ENTRY0(TDPBF16PS,  vex_amx3 chk2(W0, o64) cpuid(AMX_BF16) p_f3);
     static const X86OpEntry tdpfp16ps =
         X86_OP_ENTRY0(TDPFP16PS,  vex_amx3 chk2(W0, o64) cpuid(AMX_FP16) p_f2);
+    static const X86OpEntry tmmultf32ps =
+        X86_OP_ENTRY0(TMMULTF32PS, vex_amx3 chk2(W0, o64) cpuid(AMX_TF32) p_66);
     static const X86OpEntry tcmmfp16ps =
         X86_OP_ENTRY0(TCMMxxFP16PS, vex_amx3 chk2(W0, o64) cpuid(AMX_COMPLEX) p_00_66);
 
@@ -789,6 +792,9 @@ static void decode_amx_tdp(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         switch (*b) {
         case 0x5e:
             *entry = tdpbxxd;
+            break;
+        case 0x48:
+            *entry = tmmultf32ps;
             break;
         case 0x6c:
             *entry = tcmmfp16ps;
@@ -892,6 +898,7 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x46] = X86_OP_ENTRY3(VPSRAV,      V,x,  H,x,       W,x,  vex6 chk(W0) cpuid(AVX2) p_66),
     [0x47] = X86_OP_ENTRY3(VPSLLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
     [0x49] = X86_OP_GROUP0(amx_cfg),
+    [0x48] = X86_OP_GROUP0(amx_tdp),
     [0x4a] = X86_OP_GROUP0(amx_movrs),
     [0x4b] = X86_OP_GROUP0(amx_ldst),
     [0x5c] = X86_OP_GROUP0(amx_tdp),
@@ -3145,6 +3152,8 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
         return (s->cpuid_7_1_edx_features & CPUID_7_1_EDX_AMX_COMPLEX);
     case X86_FEAT_AMX_FP8:
         return (s->cpuid_1e_1_eax_features & CPUID_1E_1_EAX_AMX_FP8);
+    case X86_FEAT_AMX_TF32:
+        return (s->cpuid_1e_1_eax_features & CPUID_1E_1_EAX_AMX_TF32);
     case X86_FEAT_AMX_MOVRS:
         return (s->cpuid_1e_1_eax_features & CPUID_1E_1_EAX_AMX_MOVRS);
     case X86_FEAT_AMX_TILE:
