@@ -825,6 +825,27 @@ static void decode_amx_ldst(DisasContext *s, CPUX86State *env, X86OpEntry *entry
     }
 }
 
+static void decode_amx_movrs(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
+{
+    /* 0F38 4A: TILELOADDRS (F2) and TILELOADDRST1 (66), VEX forms; loads with a read-shared hint.  */
+    static const X86OpEntry tileloaddrs =
+        X86_OP_ENTRYr(TILELOADD,   M,y, vex_amx chk2(W0, o64) cpuid(AMX_MOVRS) p_f2);
+    static const X86OpEntry tileloaddrst1 =
+        X86_OP_ENTRYr(TILELOADD,   M,y, vex_amx chk2(W0, o64) cpuid(AMX_MOVRS) p_66);
+
+    uint8_t modrm = get_modrm(s, env);
+
+    if ((modrm >> 6) == 3 || (modrm & 7) != 4 || s->aflag == MO_16) {
+        *entry = UNKNOWN_OPCODE;
+    } else if (s->prefix & PREFIX_REPNZ) {
+        *entry = tileloaddrs;
+    } else if (s->prefix & PREFIX_DATA) {
+        *entry = tileloaddrst1;
+    } else {
+        *entry = UNKNOWN_OPCODE;
+    }
+}
+
 static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x00] = X86_OP_ENTRY3(PSHUFB,    V,x,  H,x,   W,x,  vex4 cpuid(SSSE3) mmx avx2_256 p_00_66),
     [0x01] = X86_OP_ENTRY3(PHADDW,    V,x,  H,x,   W,x,  vex4 cpuid(SSSE3) mmx avx2_256 p_00_66),
@@ -871,6 +892,7 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x46] = X86_OP_ENTRY3(VPSRAV,      V,x,  H,x,       W,x,  vex6 chk(W0) cpuid(AVX2) p_66),
     [0x47] = X86_OP_ENTRY3(VPSLLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
     [0x49] = X86_OP_GROUP0(amx_cfg),
+    [0x4a] = X86_OP_GROUP0(amx_movrs),
     [0x4b] = X86_OP_GROUP0(amx_ldst),
     [0x5c] = X86_OP_GROUP0(amx_tdp),
     [0x5e] = X86_OP_GROUP0(amx_tdp),
@@ -1064,6 +1086,20 @@ static void decode_0F38(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
         *entry = opcodes_0F38_00toEF[*b];
     } else {
         *entry = *decode_by_prefix(s, opcodes_0F38_F0toFF[*b & 15]);
+    }
+}
+
+/* VEX map 5: only the AMX-FP8 dot products, opcode FD (NP, 66, F3, F2).  */
+static void decode_VEX_map5(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
+{
+    static const X86OpEntry tdpxf8ps =
+        X86_OP_ENTRY0(TDPxF8PS, vex_amx3 chk2(W0, o64) cpuid(AMX_FP8) p_00_66_f3_f2);
+
+    *b = x86_ldub_code(env, s);
+    if (*b == 0xfd && (get_modrm(s, env) >> 6) == 3) {
+        *entry = tdpxf8ps;
+    } else {
+        *entry = UNKNOWN_OPCODE;
     }
 }
 
@@ -3107,6 +3143,10 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
         return (s->cpuid_7_1_eax_features & CPUID_7_1_EAX_AMX_FP16);
     case X86_FEAT_AMX_COMPLEX:
         return (s->cpuid_7_1_edx_features & CPUID_7_1_EDX_AMX_COMPLEX);
+    case X86_FEAT_AMX_FP8:
+        return (s->cpuid_1e_1_eax_features & CPUID_1E_1_EAX_AMX_FP8);
+    case X86_FEAT_AMX_MOVRS:
+        return (s->cpuid_1e_1_eax_features & CPUID_1E_1_EAX_AMX_MOVRS);
     case X86_FEAT_AMX_TILE:
         return (s->cpuid_7_0_edx_features & CPUID_7_0_EDX_AMX_TILE);
     case X86_FEAT_XSAVEC:
@@ -3624,6 +3664,9 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
                     break;
                 case 0x03: /* Implied 0f 3a leading opcode bytes.  */
                     decode_func = decode_0F3A;
+                    break;
+                case 0x05: /* Map 5, used by AMX-FP8.  */
+                    decode_func = decode_VEX_map5;
                     break;
                 default:   /* Reserved for future use.  */
                     goto unknown_op;

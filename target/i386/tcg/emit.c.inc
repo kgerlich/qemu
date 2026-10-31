@@ -5166,6 +5166,22 @@ static void gen_TCMMxxFP16PS(DisasContext *s, X86DecodedInsn *decode)
                           tcg_constant_i32((s->prefix & PREFIX_DATA) != 0));
 }
 
+/* NP: bf8 x bf8, 66: hf8 x hf8, F3: hf8 x bf8, F2: bf8 x hf8.  */
+static void gen_TDPxF8PS(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i32 dst, src1, src2;
+    int flags = 0;
+
+    gen_tdp_regs(s, &dst, &src1, &src2);
+    if (s->prefix & (PREFIX_DATA | PREFIX_REPZ)) {
+        flags |= 1;
+    }
+    if (s->prefix & (PREFIX_DATA | PREFIX_REPNZ)) {
+        flags |= 2;
+    }
+    gen_helper_tdpxf8ps(tcg_env, dst, src1, src2, tcg_constant_i32(flags));
+}
+
 static void gen_XRSTORS(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();

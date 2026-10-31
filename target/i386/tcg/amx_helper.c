@@ -498,3 +498,144 @@ void HELPER(tcmmfp16ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
     tdp_finish(env, c, rows);
 }
 
+/*
+ * 8-bit floats as a signed multiple of 2^-16, so that a sum of four products
+ * fits in a signed 128-bit integer scaled by 2^-32.  Returns false for NaN
+ * and sets *inf to +-1 for an infinity.  @hf8 selects E4M3 (no infinities,
+ * only S.1111.111 is NaN), otherwise E5M2 (IEEE-like).
+ */
+static bool fp8_decode(uint8_t v, bool hf8, int64_t *units, int *inf)
+{
+    int sign = v >> 7 ? -1 : 1;
+    int mant_bits = hf8 ? 3 : 2;
+    int exp = (v >> mant_bits) & (hf8 ? 0xf : 0x1f);
+    int bias = hf8 ? 7 : 15;
+    int man = v & ((1 << mant_bits) - 1);
+
+    *inf = 0;
+    if (hf8 ? (v & 0x7f) == 0x7f : exp == 0x1f) {
+        if (!hf8 && man == 0) {
+            *inf = sign;
+            *units = 0;
+            return true;
+        }
+        return false;
+    }
+    /* value = (1.man or 0.man) * 2^(exp-bias), in units of 2^-16 */
+    if (exp == 0) {
+        exp = 1;
+    } else {
+        man |= 1 << mant_bits;
+    }
+    *units = sign * ((int64_t)man << (exp - bias - mant_bits + 16));
+    return true;
+}
+
+/* v * 2^-32 to float32, rounding to nearest even, one rounding only.  */
+static float32 fixed_to_float32(__int128 v, float_status *st)
+{
+    bool neg = v < 0;
+    unsigned __int128 mag = neg ? -(unsigned __int128)v : v;
+    uint64_t hi = mag >> 64, lo = mag;
+    int msb, shift = 0;
+    uint64_t m;
+    float32 r;
+
+    if (!mag) {
+        return float32_zero;
+    }
+    msb = hi ? 127 - clz64(hi) : 63 - clz64(lo);
+    if (msb > 23) {
+        unsigned __int128 rest, half;
+
+        shift = msb - 23;
+        rest = mag & (((unsigned __int128)1 << shift) - 1);
+        half = (unsigned __int128)1 << (shift - 1);
+        mag >>= shift;
+        if (rest > half || (rest == half && (mag & 1))) {
+            mag++;
+        }
+    }
+    m = mag;
+    r = int64_to_float32(m, st);
+    r = float32_scalbn(r, shift - 32, st);
+    return neg ? float32_chs(r) : r;
+}
+
+/*
+ * TDP{BF8,HF8,BHF8,HBF8}PS: four fp8 products per dword are summed exactly
+ * and rounded once to FP32, then added to the accumulator.  flags bit 0 / 1
+ * say that source 1 / 2 is hf8 (E4M3).
+ */
+void HELPER(tdpxf8ps)(CPUX86State *env, uint32_t dst, uint32_t src1,
+                      uint32_t src2, uint32_t flags)
+{
+    uintptr_t ra = GETPC();
+    uint8_t *c = env->xtiledata + dst * AMX_TILE_BYTES;
+    const uint8_t *a = env->xtiledata + src1 * AMX_TILE_BYTES;
+    const uint8_t *b = env->xtiledata + src2 * AMX_TILE_BYTES;
+    float_status st = amx_fp_status(env);
+    unsigned rows, kdw, ndw, m, k, n, i;
+
+    /* Unlike the others, the FP8 multiplies take denormal inputs as they are.  */
+    set_flush_inputs_to_zero(false, &st);
+    tdp_check(env, dst, src1, src2, ra);
+    rows = tilecfg_rows(env->xtilecfg, dst);
+    kdw = tilecfg_colsb(env->xtilecfg, src1) / 4;
+    ndw = tilecfg_colsb(env->xtilecfg, dst) / 4;
+
+    for (m = 0; m < rows; m++) {
+        uint32_t tmp[AMX_MAX_COLSB / 4];
+
+        for (n = 0; n < ndw; n++) {
+            __int128 sum = 0;
+            bool nan = false, pinf = false, ninf = false;
+            float32 r;
+
+            for (k = 0; k < kdw; k++) {
+                for (i = 0; i < 4; i++) {
+                    int64_t x, y;
+                    int xi, yi;
+                    bool xok = fp8_decode(a[m * AMX_MAX_COLSB + 4 * k + i],
+                                          flags & 1, &x, &xi);
+                    bool yok = fp8_decode(b[k * AMX_MAX_COLSB + 4 * n + i],
+                                          flags & 2, &y, &yi);
+
+                    if (!xok || !yok) {
+                        nan = true;
+                    } else if (xi || yi) {
+                        /* inf * 0 is invalid, else a signed infinity */
+                        int sx = xi ? xi : (x < 0 ? -1 : 1);
+                        int sy = yi ? yi : (y < 0 ? -1 : 1);
+
+                        if ((xi && !yi && !y) || (yi && !xi && !x)) {
+                            nan = true;
+                        } else if (sx * sy > 0) {
+                            pinf = true;
+                        } else {
+                            ninf = true;
+                        }
+                    } else {
+                        sum += (__int128)x * y;
+                    }
+                }
+            }
+            if (nan || (pinf && ninf)) {
+                r = make_float32(0xffc00000);
+            } else if (pinf || ninf) {
+                r = pinf ? float32_infinity : float32_chs(float32_infinity);
+            } else {
+                r = fixed_to_float32(sum, &st);
+            }
+            if (float32_is_any_nan(ldl_le_p(c + m * AMX_MAX_COLSB + 4 * n))) {
+                r = make_float32(0xffc00000);
+                tmp[n] = r;
+            } else {
+                tmp[n] = float32_add(ldl_le_p(c + m * AMX_MAX_COLSB + 4 * n),
+                                     r, &st);
+            }
+        }
+        tdp_finish_row(c, m, tmp, ndw);
+    }
+    tdp_finish(env, c, rows);
+}
