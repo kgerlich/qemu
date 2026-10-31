@@ -203,6 +203,18 @@ void HELPER(wrmsr)(CPUX86State *env)
         env->pkrs = val;
         tlb_flush(cs);
         break;
+    case MSR_IA32_XFD:
+    case MSR_IA32_XFD_ERR:
+        if (!(env->features[FEAT_XSAVE] & CPUID_XSAVE_XFD) ||
+            (val & ~XSTATE_DYNAMIC_MASK)) {
+            goto error;
+        }
+        if ((uint32_t)env->regs[R_ECX] == MSR_IA32_XFD) {
+            env->msr_xfd = val;
+        } else {
+            env->msr_xfd_err = val;
+        }
+        break;
     case MSR_IA32_XSS: {
         uint64_t supported = ((uint64_t)env->features[FEAT_XSAVE_XSS_HI] << 32) |
                              env->features[FEAT_XSAVE_XSS_LO];
@@ -369,6 +381,14 @@ void HELPER(rdmsr)(CPUX86State *env)
         break;
     case MSR_IA32_PKRS:
         val = env->pkrs;
+        break;
+    case MSR_IA32_XFD:
+    case MSR_IA32_XFD_ERR:
+        if (!(env->features[FEAT_XSAVE] & CPUID_XSAVE_XFD)) {
+            raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+        }
+        val = (uint32_t)env->regs[R_ECX] == MSR_IA32_XFD ?
+              env->msr_xfd : env->msr_xfd_err;
         break;
     case MSR_IA32_XSS:
         if (!(env->features[FEAT_XSAVE] & CPUID_XSAVE_XSAVES)) {

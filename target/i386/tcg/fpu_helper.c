@@ -2725,6 +2725,26 @@ static void do_xsave_apx(X86Access *ac, target_ulong ptr)
 }
 #endif
 
+static void do_xsave_xtilecfg(X86Access *ac, target_ulong ptr)
+{
+    CPUX86State *env = ac->env;
+    int i;
+
+    for (i = 0; i < sizeof(env->xtilecfg); i += 8) {
+        access_stq(ac, ptr + i, ldq_le_p(env->xtilecfg + i));
+    }
+}
+
+static void do_xsave_xtiledata(X86Access *ac, target_ulong ptr)
+{
+    CPUX86State *env = ac->env;
+    int i;
+
+    for (i = 0; i < sizeof(env->xtiledata); i += 8) {
+        access_stq(ac, ptr + i, ldq_le_p(env->xtiledata + i));
+    }
+}
+
 static void do_fxsave(X86Access *ac, target_ulong ptr)
 {
     CPUX86State *env = ac->env;
@@ -2767,6 +2787,15 @@ static uint64_t get_xinuse(CPUX86State *env)
     if ((env->hflags & HF_MPX_IU_MASK) == 0) {
        inuse &= ~XSTATE_BNDREGS_MASK;
     }
+
+    /*
+     * The tiles are in their initial state until a palette is loaded, and
+     * look initial while XFD is armed for them.
+     */
+    if (env->xtilecfg[0] == 0) {
+        inuse &= ~(XSTATE_XTILE_CFG_MASK | XSTATE_XTILE_DATA_MASK);
+    }
+    inuse &= ~(env->msr_xfd & XSTATE_DYNAMIC_MASK);
     return inuse;
 }
 
@@ -2834,6 +2863,12 @@ static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
         do_xsave_apx(ac, ptr + xsave_comp_off(XSTATE_APX_BIT, layout));
     }
 #endif
+    if (opt & XSTATE_XTILE_CFG_MASK) {
+        do_xsave_xtilecfg(ac, ptr + xsave_comp_off(XSTATE_XTILE_CFG_BIT, layout));
+    }
+    if (opt & XSTATE_XTILE_DATA_MASK) {
+        do_xsave_xtiledata(ac, ptr + xsave_comp_off(XSTATE_XTILE_DATA_BIT, layout));
+    }
 
     if (layout & XCOMP_BV_COMPACTED) {
         /* The compacted header is written afresh, reserved bytes zeroed.  */
@@ -3093,6 +3128,54 @@ static void do_clear_apx(X86Access *ac)
 }
 #endif
 
+/*
+ * A tile configuration is valid if it names palette 0 (no tiles) or palette 1
+ * with tiles no larger than the palette allows, and has no reserved bits set.
+ */
+static bool valid_xtilecfg(const uint8_t *cfg)
+{
+    int i;
+
+    if (cfg[0] > 1 || cfg[1] != 0) {
+        return false;
+    }
+    for (i = 2; i < 16; i++) {
+        if (cfg[i]) {
+            return false;
+        }
+    }
+    for (i = 0; i < 16; i++) {
+        uint16_t colsb = lduw_le_p(cfg + 16 + 2 * i);
+        uint8_t rows = cfg[48 + i];
+
+        if (cfg[0] == 0 ? (colsb || rows) :
+            (i >= 8 ? (colsb || rows) : (colsb > 64 || rows > 16))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void do_xrstor_xtilecfg(X86Access *ac, target_ulong ptr)
+{
+    CPUX86State *env = ac->env;
+    int i;
+
+    for (i = 0; i < sizeof(env->xtilecfg); i += 8) {
+        stq_le_p(env->xtilecfg + i, access_ldq(ac, ptr + i));
+    }
+}
+
+static void do_xrstor_xtiledata(X86Access *ac, target_ulong ptr)
+{
+    CPUX86State *env = ac->env;
+    int i;
+
+    for (i = 0; i < sizeof(env->xtiledata); i += 8) {
+        stq_le_p(env->xtiledata + i, access_ldq(ac, ptr + i));
+    }
+}
+
 void HELPER(fxrstor)(CPUX86State *env, target_ulong ptr)
 {
     uintptr_t ra = GETPC();
@@ -3234,6 +3317,20 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
         }
     }
 #endif
+    if (rfbm & XSTATE_XTILE_CFG_MASK) {
+        if (xstate_bv & XSTATE_XTILE_CFG_MASK) {
+            do_xrstor_xtilecfg(ac, ptr + xsave_comp_off(XSTATE_XTILE_CFG_BIT, layout));
+        } else {
+            memset(env->xtilecfg, 0, sizeof(env->xtilecfg));
+        }
+    }
+    if (rfbm & XSTATE_XTILE_DATA_MASK) {
+        if (xstate_bv & XSTATE_XTILE_DATA_MASK) {
+            do_xrstor_xtiledata(ac, ptr + xsave_comp_off(XSTATE_XTILE_DATA_BIT, layout));
+        } else {
+            memset(env->xtiledata, 0, sizeof(env->xtiledata));
+        }
+    }
 }
 
 #undef XO
@@ -3257,6 +3354,16 @@ static void do_xrstor_insn(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
 
     rfbm &= enabled;
 
+    /* Restoring a component that XFD disables raises #NM.  */
+    if (env->features[FEAT_XSAVE] & CPUID_XSAVE_XFD) {
+        uint64_t armed = env->msr_xfd & XSTATE_DYNAMIC_MASK & rfbm & xstate_bv;
+
+        if (armed) {
+            env->msr_xfd_err = armed;
+            raise_exception_ra(env, EXCP07_PREX, ra);
+        }
+    }
+
     if (xcomp_bv) {
         size_ext = xsave_area_size(xcomp_bv & ~XCOMP_BV_COMPACTED, true);
     } else {
@@ -3265,6 +3372,20 @@ static void do_xrstor_insn(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     if (size < size_ext) {
         /* TODO: See if existing page probe has covered extra size. */
         access_prepare(&ac, env, ptr, size_ext, MMU_DATA_LOAD, ra);
+    }
+
+    /* A bad tile configuration must fault before any state changes.  */
+    if (rfbm & xstate_bv & XSTATE_XTILE_CFG_MASK) {
+        uint8_t cfg[64];
+        int i;
+
+        for (i = 0; i < sizeof(cfg); i += 8) {
+            stq_le_p(cfg + i, access_ldq(&ac, ptr +
+                     xsave_comp_off(XSTATE_XTILE_CFG_BIT, xcomp_bv) + i));
+        }
+        if (!valid_xtilecfg(cfg)) {
+            raise_exception_ra(env, EXCP0D_GPF, ra);
+        }
     }
 
     do_xrstor(&ac, ptr, rfbm, xstate_bv, xcomp_bv);
@@ -3421,6 +3542,11 @@ void HELPER(xsetbv)(CPUX86State *env, uint32_t ecx, uint64_t mask)
     cpu_x86_cpuid(env, 0x0d, 0, &ena_lo, &dummy, &dummy, &ena_hi);
     ena = ((uint64_t)ena_hi << 32) | ena_lo;
     if (mask & ~ena) {
+        goto do_gpf;
+    }
+
+    /* The two AMX components are enabled together or not at all.  */
+    if (((mask >> XSTATE_XTILE_CFG_BIT) ^ (mask >> XSTATE_XTILE_DATA_BIT)) & 1) {
         goto do_gpf;
     }
 

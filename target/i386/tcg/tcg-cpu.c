@@ -208,6 +208,13 @@ static void x86_tcg_cpu_xsave_init(void)
     XO(XSTATE_Hi16_ZMM_BIT, hi16_zmm_state);
     XO(XSTATE_PKRU_BIT, pkru_state);
     XO(XSTATE_APX_BIT, apx_state);
+    XO(XSTATE_XTILE_CFG_BIT, xtilecfg_state);
+    XO(XSTATE_XTILE_DATA_BIT, xtiledata_state);
+
+    /* Compacted format: tile state is 64-byte aligned, tile data has XFD.  */
+    x86_ext_save_areas[XSTATE_XTILE_CFG_BIT].ecx = ESA_FEATURE_ALIGN64_MASK;
+    x86_ext_save_areas[XSTATE_XTILE_DATA_BIT].ecx =
+        ESA_FEATURE_ALIGN64_MASK | ESA_FEATURE_XFD_MASK;
 
 #undef XO
 }

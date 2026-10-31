@@ -37,6 +37,8 @@
 #define XSAVE_ZMM_HI256_OFFSET  0x480
 #define XSAVE_HI16_ZMM_OFFSET   0x680
 #define XSAVE_PKRU_OFFSET       0xa80
+#define XSAVE_XTILECFG_OFFSET   0xac0
+#define XSAVE_XTILEDATA_OFFSET  0xb00
 
 typedef struct X86XSaveArea {
     X86LegacyXSaveArea legacy;
@@ -68,6 +70,14 @@ typedef struct X86XSaveArea {
     XSaveHi16_ZMM hi16_zmm_state;
     /* PKRU State: */
     XSavePKRU pkru_state;
+
+    /* Ensure that XSaveXTILECFG is properly aligned. */
+    uint8_t padding2[XSAVE_XTILECFG_OFFSET
+                     - XSAVE_PKRU_OFFSET - sizeof(XSavePKRU)];
+
+    /* AMX State: */
+    XSaveXTILECFG xtilecfg_state;
+    XSaveXTILEDATA xtiledata_state;
 } X86XSaveArea;
 
 QEMU_BUILD_BUG_ON(offsetof(X86XSaveArea, legacy.fcw) != XSAVE_FCW_FSW_OFFSET);
@@ -85,6 +95,8 @@ QEMU_BUILD_BUG_ON(offsetof(X86XSaveArea, opmask_state) != XSAVE_OPMASK_OFFSET);
 QEMU_BUILD_BUG_ON(offsetof(X86XSaveArea, zmm_hi256_state) != XSAVE_ZMM_HI256_OFFSET);
 QEMU_BUILD_BUG_ON(offsetof(X86XSaveArea, hi16_zmm_state) != XSAVE_HI16_ZMM_OFFSET);
 QEMU_BUILD_BUG_ON(offsetof(X86XSaveArea, pkru_state) != XSAVE_PKRU_OFFSET);
+QEMU_BUILD_BUG_ON(offsetof(X86XSaveArea, xtilecfg_state) != XSAVE_XTILECFG_OFFSET);
+QEMU_BUILD_BUG_ON(offsetof(X86XSaveArea, xtiledata_state) != XSAVE_XTILEDATA_OFFSET);
 
 extern const TCGCPUOps x86_tcg_ops;
 
