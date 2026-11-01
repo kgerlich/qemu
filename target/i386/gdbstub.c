@@ -25,6 +25,9 @@
 #ifdef CONFIG_LINUX_USER
 #include "linux-user/qemu.h"
 #endif
+#ifdef CONFIG_TCG
+#include "tcg/helper-tcg.h"
+#endif
 
 #ifdef TARGET_X86_64
 static const int gpr_map[CPU_NB_EREGS] = {
@@ -494,6 +497,54 @@ static int i386_cpu_gdb_set_egprs(CPUState *cs, uint8_t *mem_buf, int n)
     }
     return 0;
 }
+
+/*
+ * AMX: register 0 is the 64-byte tile configuration, registers 1 to 8 are
+ * the tiles tmm0 to tmm7, 1024 bytes each (row r at offset r * 64).
+ */
+#define AMX_GDB_NUM_TMM    8
+#define AMX_GDB_TILE_SIZE  1024
+
+static int i386_cpu_gdb_get_amx(CPUState *cs, GByteArray *mem_buf, int n)
+{
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    if (n == 0) {
+        g_byte_array_append(mem_buf, env->xtilecfg, sizeof(env->xtilecfg));
+        return sizeof(env->xtilecfg);
+    }
+    if (n <= AMX_GDB_NUM_TMM) {
+        g_byte_array_append(mem_buf,
+                           &env->xtiledata[(n - 1) * AMX_GDB_TILE_SIZE],
+                           AMX_GDB_TILE_SIZE);
+        return AMX_GDB_TILE_SIZE;
+    }
+    return 0;
+}
+
+static int i386_cpu_gdb_set_amx(CPUState *cs, uint8_t *mem_buf, int n)
+{
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    if (n == 0) {
+#ifdef CONFIG_TCG
+        /* A bad configuration would let tile instructions run out of bounds. */
+        if (!x86_tilecfg_valid(mem_buf, true)) {
+            return 0;
+        }
+#endif
+        memcpy(env->xtilecfg, mem_buf, sizeof(env->xtilecfg));
+        env->xstate_bv |= XSTATE_XTILE_CFG_MASK;
+        return sizeof(env->xtilecfg);
+    }
+    if (n <= AMX_GDB_NUM_TMM) {
+        memcpy(&env->xtiledata[(n - 1) * AMX_GDB_TILE_SIZE], mem_buf,
+               AMX_GDB_TILE_SIZE);
+        env->xstate_bv |= XSTATE_XTILE_DATA_MASK;
+        return AMX_GDB_TILE_SIZE;
+    }
+    return 0;
+}
 #endif
 
 void x86_cpu_gdb_init(CPUState *cs)
@@ -505,6 +556,12 @@ void x86_cpu_gdb_init(CPUState *cs)
         gdb_register_coprocessor(cs, i386_cpu_gdb_get_egprs,
                                  i386_cpu_gdb_set_egprs,
                                  gdb_find_static_feature("i386-64bit-apx.xml"));
+    }
+
+    if (env->features[FEAT_7_0_EDX] & CPUID_7_0_EDX_AMX_TILE) {
+        gdb_register_coprocessor(cs, i386_cpu_gdb_get_amx,
+                                 i386_cpu_gdb_set_amx,
+                                 gdb_find_static_feature("i386-64bit-amx.xml"));
     }
 #endif
 
