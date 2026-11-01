@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- Copyright (C) 2026 Free Software Foundation, Inc.
+<!-- Copyright (C) 2020-2026 Free Software Foundation, Inc.
 
      Copying and distribution of this file, with or without modification,
      are permitted in any medium without royalty provided the copyright
@@ -7,24 +7,20 @@
 
 <!DOCTYPE feature SYSTEM "gdb-target.dtd">
 <feature name="org.gnu.gdb.i386.amx">
-  <vector id="v14u8" type="uint8" count="14"/>
-  <vector id="v16u8" type="uint8" count="16"/>
-  <vector id="v16u16" type="uint16" count="16"/>
-  <struct id="tilecfg_t">
-    <field name="palette" type="uint8"/>
-    <field name="start_row" type="uint8"/>
-    <field name="reserved" type="v14u8"/>
-    <field name="colsb" type="v16u16"/>
-    <field name="rows" type="v16u8"/>
-  </struct>
-  <vector id="v1024u8" type="uint8" count="1024"/>
-  <reg name="tilecfg" bitsize="512" type="tilecfg_t"/>
-  <reg name="tmm0" bitsize="8192" type="v1024u8"/>
-  <reg name="tmm1" bitsize="8192" type="v1024u8"/>
-  <reg name="tmm2" bitsize="8192" type="v1024u8"/>
-  <reg name="tmm3" bitsize="8192" type="v1024u8"/>
-  <reg name="tmm4" bitsize="8192" type="v1024u8"/>
-  <reg name="tmm5" bitsize="8192" type="v1024u8"/>
-  <reg name="tmm6" bitsize="8192" type="v1024u8"/>
-  <reg name="tmm7" bitsize="8192" type="v1024u8"/>
+  <!-- One uint512 value per row of a tile.  -->
+  <vector id="v_ui512" type="uint512" count="16"/>
+
+  <!-- The raw contents of the tile configuration register.  -->
+  <reg name="tilecfg_raw" bitsize="512" type="uint512"/>
+
+  <!-- The raw contents of the eight tiles, each of which is 16 rows of
+       64 bytes.  -->
+  <reg name="tmm0_raw" bitsize="8192" type="v_ui512"/>
+  <reg name="tmm1_raw" bitsize="8192" type="v_ui512"/>
+  <reg name="tmm2_raw" bitsize="8192" type="v_ui512"/>
+  <reg name="tmm3_raw" bitsize="8192" type="v_ui512"/>
+  <reg name="tmm4_raw" bitsize="8192" type="v_ui512"/>
+  <reg name="tmm5_raw" bitsize="8192" type="v_ui512"/>
+  <reg name="tmm6_raw" bitsize="8192" type="v_ui512"/>
+  <reg name="tmm7_raw" bitsize="8192" type="v_ui512"/>
 </feature>

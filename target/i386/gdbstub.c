@@ -499,8 +499,8 @@ static int i386_cpu_gdb_set_egprs(CPUState *cs, uint8_t *mem_buf, int n)
 }
 
 /*
- * AMX: register 0 is the 64-byte tile configuration, registers 1 to 8 are
- * the tiles tmm0 to tmm7, 1024 bytes each (row r at offset r * 64).
+ * AMX: register 0 is the 64-byte tile configuration (tilecfg_raw), 1 to 8 are
+ * the tiles tmm0_raw to tmm7_raw, 1024 bytes each (row r at offset r * 64).
  */
 #define AMX_GDB_NUM_TMM    8
 #define AMX_GDB_TILE_SIZE  1024
